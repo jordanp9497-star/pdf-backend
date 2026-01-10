@@ -1,0 +1,2265 @@
+// ===== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT EN PREMIER =====
+// CRITIQUE: dotenv.config() DOIT être appelé AVANT tout autre import local
+// pour garantir que les variables d'environnement sont disponibles
+import dotenv from "dotenv";
+dotenv.config();
+
+// Logs temporaires de diagnostic
+console.log("🔥 STARTUP FILE:", import.meta.url);
+console.log("🔥 ENV OPENAI_API_KEY LOADED:", !!process.env.OPENAI_API_KEY);
+
+// Imports nécessaires pour le chemin du .env (après dotenv.config())
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Obtenir __dirname en ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Vérification CRITIQUE de OPENAI_API_KEY
+console.log("🔥 ENV OPENAI_API_KEY RAW:", process.env.OPENAI_API_KEY);
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("❌ FATAL: OPENAI_API_KEY NON CHARGÉE AU DÉMARRAGE");
+}
+
+// Logs de vérification
+console.log('ENV CHECK → cwd:', process.cwd());
+console.log('ENV CHECK → OPENAI:', !!process.env.OPENAI_API_KEY);
+if (process.env.OPENAI_API_KEY) {
+  console.log('ENV CHECK → OPENAI_KEY length:', process.env.OPENAI_API_KEY.length);
+  console.log('ENV CHECK → OPENAI_KEY starts with sk-:', process.env.OPENAI_API_KEY.startsWith('sk-'));
+} else {
+  console.error('ENV CHECK → ❌ OPENAI_API_KEY est ABSENTE - La pré-structuration IA ne fonctionnera pas');
+}
+console.log('ENV CHECK → MISTRAL:', !!process.env.MISTRAL_API_KEY);
+
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import pdfParse from 'pdf-parse';
+import { randomUUID } from 'crypto';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ===== STOCKAGE DE LA CLÉ OPENAI DANS app.locals =====
+// Charger la clé UNE FOIS au démarrage et la stocker dans app.locals
+// pour garantir l'accès fiable dans toutes les routes
+app.locals.OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+console.log('ENV CHECK → OPENAI (locals):', !!app.locals.OPENAI_API_KEY);
+
+// ===== CONFIGURATION DES BODY PARSERS AU TOUT DÉBUT =====
+// CRITIQUE: Ces middlewares DOIVENT être placés AVANT tout autre middleware
+// IMPORTANT: body-parser (ou sa configuration par défaut) causait PayloadTooLargeError (HTTP 413) avec les photos base64
+// Solution: Utiliser UNIQUEMENT express.json et express.urlencoded avec limite de 25mb
+// Les images OCR en base64 peuvent être très volumineuses (plusieurs MB)
+// Aucun body-parser ne doit être utilisé dans le projet (ni import, ni app.use)
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
+
+// URL du webhook n8n pour la structuration d'ordonnances
+const N8N_WEBHOOK_URL = 'https://jordanconsultia.app.n8n.cloud/webhook/pdf-ordonnance';
+
+// URL du webhook n8n pour l'OCR manuscrit
+const N8N_OCR_WEBHOOK_URL = 'https://jordanconsultia.app.n8n.cloud/webhook/ocr-image';
+
+// Log de vérification au démarrage pour confirmer que la route est enregistrée
+console.log('🔍 Route POST /api/ocr/handwritten enregistrée');
+
+// Configuration CORS
+app.use(cors());
+
+// Middleware de logging pour diagnostiquer les routes (temporaire pour debug)
+app.use((req, res, next) => {
+  // Logger uniquement les requêtes vers /api/ocr pour ne pas polluer les logs
+  if (req.path.includes('/api/ocr') || req.path.includes('/ocr')) {
+    console.log('🔍 ===== REQUÊTE REÇUE =====');
+    console.log('📥 Méthode:', req.method);
+    console.log('🔗 Path:', req.path);
+    console.log('🔗 URL complète:', req.url);
+    console.log('📋 Query params:', req.query);
+  }
+  next();
+});
+
+// Stockage en mémoire pour les ordonnances (à remplacer par une vraie base de données en production)
+const ordonnances = [];
+
+/**
+ * Fonction centrale pour créer une ordonnance au format standard
+ * Utilisée par toutes les routes (PDF et OCR)
+ * @param {Object} data - Données de l'ordonnance
+ * @param {string} data.source - Source de l'ordonnance ("pdf" ou "ocr_manuscrit")
+ * @param {string} data.rawText - Texte brut de l'ordonnance
+ * @param {string|null} data.doctorName - Nom du médecin
+ * @param {string|null} data.patientName - Nom du patient
+ * @param {Array} data.medications - Liste des médicaments
+ * @param {string} data.status - Statut de l'ordonnance (défaut: "a_recuperer")
+ * @param {string} data.createdAt - Date de création (ISO string)
+ * @returns {Object} Ordonnance créée avec id généré
+ */
+function createOrdonnance(data) {
+  const ordonnance = {
+    id: randomUUID(),
+    source: data.source || 'pdf',
+    rawText: data.rawText || '',
+    doctorName: data.doctorName || null,
+    patientName: data.patientName || null,
+    medications: data.medications || [],
+    status: data.status || 'a_recuperer',
+    createdAt: data.createdAt || new Date().toISOString(),
+    type: data.type || null // Type d'ordonnance (MEDICAMENT ou RENDEZ_VOUS)
+  };
+
+  // Ajouter au store principal
+  ordonnances.push(ordonnance);
+  console.log('[ORD STORE] Ordonnance ajoutée au store principal');
+  console.log('[ORD STORE] ID:', ordonnance.id);
+  console.log('[ORD STORE] Source:', ordonnance.source);
+  console.log('[ORD STORE] Type:', ordonnance.type || 'non spécifié');
+  console.log('[ORD STORE] Total ordonnances:', ordonnances.length);
+
+  return ordonnance;
+}
+
+// Configuration de multer pour gérer l'upload en mémoire
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024 // Limite de 10MB
+  }
+});
+
+// Fonction pour structurer le texte en sections médicales explicites
+function structureText(text) {
+  if (!text) return text;
+
+  // Normaliser le texte : diviser en lignes
+  const lines = text.split('\n').map(line => line.trim()).filter(line => line !== '');
+  
+  // Initialiser les sections
+  const prescripteur = [];
+  const datePrescription = [];
+  const patient = [];
+  const medicaments = [];
+  const informationsComplementaires = [];
+
+  // Parcourir chaque ligne et la classer
+  for (const line of lines) {
+    const lowerLine = line.toLowerCase();
+    
+    // 1. PRESCRIPTEUR : Médecin, GÉNÉRALISTE, adresse, téléphone, email
+    if (
+      lowerLine.includes('médecin') ||
+      lowerLine.includes('généraliste') ||
+      lowerLine.includes('docteur') ||
+      lowerLine.includes('dr.') ||
+      lowerLine.includes('dr ') ||
+      lowerLine.includes('@') ||
+      lowerLine.includes('tel') ||
+      lowerLine.includes('tél') ||
+      lowerLine.includes('rue') ||
+      lowerLine.includes('avenue') ||
+      lowerLine.includes('boulevard') ||
+      lowerLine.includes('phone') ||
+      (lowerLine.match(/\d{2}\s\d{2}\s\d{2}\s\d{2}\s\d{2}/) && !lowerLine.includes('né')) ||
+      (lowerLine.match(/\d{10}/) && !lowerLine.includes('né'))
+    ) {
+      prescripteur.push(line);
+      continue;
+    }
+
+    // 2. DATE_PRESCRIPTION : Dates isolées "Le 23 mars 2025" ou formats similaires
+    const monthNames = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+    const hasMonth = monthNames.some(month => lowerLine.includes(month));
+    
+    if (
+      (lowerLine.includes('le ') && lowerLine.includes('202')) ||
+      lowerLine.match(/^le\s+\d{1,2}\s+\w+\s+\d{4}$/i) ||
+      lowerLine.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/) ||
+      lowerLine.match(/^\d{1,2}\s+\w+\s+\d{4}$/i) ||
+      (lowerLine.startsWith('le ') && hasMonth)
+    ) {
+      datePrescription.push(line);
+      continue;
+    }
+
+    // 3. PATIENT : M., Mme, né(e), Né(e)
+    if (
+      lowerLine.includes('m. ') ||
+      lowerLine.includes('mme ') ||
+      lowerLine.includes('melle ') ||
+      lowerLine.includes('né ') ||
+      lowerLine.includes('née ') ||
+      lowerLine.includes('né(e)') ||
+      lowerLine.includes('née(e)') ||
+      lowerLine.startsWith('m.') ||
+      lowerLine.startsWith('mme') ||
+      lowerLine.startsWith('melle')
+    ) {
+      patient.push(line);
+      continue;
+    }
+
+    // 4. MEDICAMENTS : Noms en majuscules, posologie (fois, jours, mg, g, sachet, comprimé)
+    const hasPosologie = (
+      lowerLine.includes('fois') ||
+      lowerLine.includes('jour') ||
+      lowerLine.includes('mg') ||
+      lowerLine.includes(' g ') ||
+      lowerLine.match(/\d+g\b/) ||
+      lowerLine.match(/\d+mg/) ||
+      lowerLine.includes('sachet') ||
+      lowerLine.includes('comprimé') ||
+      lowerLine.includes('comp') ||
+      lowerLine.includes('cp') ||
+      lowerLine.includes('ml') ||
+      lowerLine.includes('matin') ||
+      lowerLine.includes('soir') ||
+      lowerLine.includes('midi')
+    );
+
+    const hasMedicamentName = (
+      line.match(/^[A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ\s]+/) ||
+      line.match(/[A-Z]{3,}/) ||
+      lowerLine.includes('doliprane') ||
+      lowerLine.includes('paracétamol') ||
+      lowerLine.includes('amoxicilline') ||
+      lowerLine.includes('ibuprofène') ||
+      lowerLine.includes('aspirine')
+    );
+
+    if (hasPosologie || hasMedicamentName) {
+      medicaments.push(line);
+      continue;
+    }
+
+    // 5. INFORMATIONS_COMPLEMENTAIRES : Tout le reste
+    informationsComplementaires.push(line);
+  }
+
+  // Construire le texte structuré avec les sections
+  let structuredText = '';
+
+  if (prescripteur.length > 0) {
+    structuredText += 'PRESCRIPTEUR:\n';
+    structuredText += prescripteur.join('\n') + '\n\n';
+  }
+
+  if (datePrescription.length > 0) {
+    structuredText += 'DATE_PRESCRIPTION:\n';
+    structuredText += datePrescription.join('\n') + '\n\n';
+  }
+
+  if (patient.length > 0) {
+    structuredText += 'PATIENT:\n';
+    structuredText += patient.join('\n') + '\n\n';
+  }
+
+  if (medicaments.length > 0) {
+    structuredText += 'MEDICAMENTS:\n';
+    structuredText += medicaments.join('\n') + '\n\n';
+  }
+
+  if (informationsComplementaires.length > 0) {
+    structuredText += 'INFORMATIONS_COMPLEMENTAIRES:\n';
+    structuredText += informationsComplementaires.join('\n') + '\n';
+  }
+
+  return structuredText.trim();
+}
+
+// Route GET /
+app.get('/', (req, res) => {
+  res.send('BACKEND OK');
+});
+
+// Route GET /ping
+app.get('/ping', (req, res) => {
+  console.log('PING OK');
+  res.json({ status: 'OK', source: 'backend' });
+});
+
+// Route GET /health - Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
+// Route POST /extract
+app.post('/extract', upload.single('file'), (req, res) => {
+  // Retourner une réponse factice pour tester l'upload
+  res.json({ text: 'PDF bien reçu' });
+});
+
+// Route POST /analyze-ordonnance-test
+app.post('/analyze-ordonnance-test', (req, res) => {
+  console.log('TEST BACKEND OK');
+  res.json({ status: 'OK', message: 'Backend reachable' });
+});
+
+// Route POST /analyze-ordonnance
+app.post('/analyze-ordonnance', upload.single('file'), async (req, res) => {
+  try {
+    // 1. Vérifier qu'un fichier a été uploadé
+    if (!req.file) {
+      return res.status(400).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 2. Vérifier que c'est bien un PDF
+    if (req.file.mimetype !== 'application/pdf') {
+      return res.status(400).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 3. Extraire le texte du PDF
+    let extractedText;
+    try {
+      const pdfData = await pdfParse(req.file.buffer);
+      extractedText = pdfData.text.trim();
+    } catch (error) {
+      console.error('Erreur lors de l\'extraction PDF:', error);
+      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 4. Vérifier que du texte a été extrait
+    if (!extractedText || extractedText.length === 0) {
+      return res.status(400).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // Log du texte brut extrait du PDF
+    console.log("===== TEXTE PDF BRUT =====");
+    console.log(extractedText);
+    console.log("==========================");
+
+    // 5. Structurer le texte en sections médicales explicites
+    const structuredText = structureText(extractedText);
+    console.log("===== TEXTE STRUCTURÉ =====");
+    console.log(structuredText);
+    console.log("============================");
+
+    // 6. Appeler le webhook n8n avec le texte structuré
+    const n8nData = {
+      text: structuredText
+    };
+
+    let n8nResponse;
+    try {
+      n8nResponse = await fetch(N8N_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(n8nData)
+      });
+    } catch (error) {
+      console.error('Erreur lors de l\'appel n8n:', error);
+      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 7. Lire la réponse brute de n8n
+    const rawText = await n8nResponse.text();
+
+    if (!rawText || rawText.trim() === "") {
+      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 8. Parser la réponse JSON de n8n
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (e) {
+      console.error('Erreur parsing réponse n8n:', e);
+      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 9. Extraire et parser le champ result (qui contient un JSON stringifié)
+    if (!parsed.result) {
+      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    let finalObject;
+    try {
+      finalObject = JSON.parse(parsed.result);
+    } catch (e) {
+      console.error('Erreur parsing result:', e);
+      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    }
+
+    // 10. Vérifier que finalObject est bien un objet
+    if (typeof finalObject === 'string') {
+      try {
+        finalObject = JSON.parse(finalObject);
+      } catch (e) {
+        return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      }
+    }
+
+    // 11. Transformer la réponse n8n au format Medicalia standard et stocker l'ordonnance
+    const ordonnanceData = {
+      source: 'pdf',
+      rawText: extractedText,
+      doctorName: finalObject.meta?.prescripteur?.nom || 
+                  finalObject.prescripteur?.nom || 
+                  finalObject.doctorName || 
+                  null,
+      patientName: finalObject.patient?.nom || 
+                   finalObject.patientName || 
+                   null,
+      medications: [],
+      status: 'a_recuperer',
+      createdAt: new Date().toISOString()
+    };
+
+    // Transformer les médicaments
+    if (finalObject.medicaments && Array.isArray(finalObject.medicaments)) {
+      ordonnanceData.medications = finalObject.medicaments.map(med => ({
+        name: med.nom || med.name || '',
+        dosage: med.posologie || med.dosage || '',
+        frequency: med.frequence || med.frequency || '',
+        duration: med.duree || med.duration || null
+      }));
+    } else if (finalObject.medications && Array.isArray(finalObject.medications)) {
+      ordonnanceData.medications = finalObject.medications.map(med => ({
+        name: med.name || '',
+        dosage: med.dosage || '',
+        frequency: med.frequency || '',
+        duration: med.duration || null
+      }));
+    }
+
+    // Créer et stocker l'ordonnance PDF dans le store principal
+    const ordonnance = createOrdonnance(ordonnanceData);
+    console.log('[PDF ORD] Ordonnance PDF stockée dans le store principal');
+
+    // 12. Retourner directement l'objet JSON final au client
+    res.json(finalObject);
+
+  } catch (error) {
+    console.error('Erreur générale /analyze-ordonnance:', error);
+    res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+  }
+});
+
+// Route GET /test-n8n
+app.get('/test-n8n', async (req, res) => {
+  try {
+    const testData = {
+      text: 'Dr Jean Dupont\nOrdonnance pour Monsieur Martin\nAmoxicilline 1g 1 comprimé matin et soir pendant 7 jours\nDoliprane 1000mg si douleur'
+    };
+
+    console.log('➡️ Appel n8n...');
+
+    const response = await fetch(N8N_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(testData)
+    });
+
+    const rawText = await response.text();
+
+    console.log("⬅️ Réponse brute n8n :", rawText);
+
+    if (!rawText || rawText.trim() === "") {
+      return res.status(500).json({
+        error: "N8N_EMPTY_RESPONSE"
+      });
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (e) {
+      return res.status(500).json({
+        error: "N8N_INVALID_JSON",
+        raw: rawText
+      });
+    }
+
+    // Extraire et parser le champ result qui contient une chaîne JSON
+    if (!parsed.result) {
+      return res.status(500).json({
+        error: "N8N_MISSING_RESULT",
+        raw: parsed
+      });
+    }
+
+    let finalObject;
+    try {
+      finalObject = JSON.parse(parsed.result);
+    } catch (e) {
+      return res.status(500).json({
+        error: "INVALID_JSON_FROM_N8N",
+        raw: parsed.result
+      });
+    }
+
+    // Vérifier que finalObject est bien un objet et non une string
+    if (typeof finalObject === 'string') {
+      try {
+        finalObject = JSON.parse(finalObject);
+      } catch (e) {
+        return res.status(500).json({
+          error: "INVALID_JSON_FROM_N8N",
+          raw: finalObject
+        });
+      }
+    }
+
+    console.log("FINAL JSON SENT TO CLIENT", finalObject);
+
+    // Retourner UNIQUEMENT l'objet JSON parsé (sans la clé "result")
+    res.json(finalObject);
+
+  } catch (error) {
+    console.error('❌ Erreur lors de l\'appel n8n:', error);
+    res.status(500).json({ 
+      error: 'Erreur lors de l\'appel n8n',
+      message: error.message 
+    });
+  }
+});
+
+// Configuration Multer spécifique pour l'OCR manuscrit (isolée des autres routes)
+const ocrUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024 // Limite de 10MB
+  }
+});
+
+// Route POST /api/ocr/handwritten - OCR manuscrit (photo d'ordonnance)
+app.post('/api/ocr/handwritten', (req, res, next) => {
+  // Log AVANT Multer pour confirmer que la route est atteinte
+  console.log('✅ ===== ROUTE /api/ocr/handwritten ATTEINTE (AVANT MULTER) =====');
+  console.log('📥 Méthode:', req.method);
+  console.log('🔗 URL:', req.url);
+  console.log('📋 Headers Content-Type:', req.headers['content-type']);
+  console.log('📋 Content-Length:', req.headers['content-length']);
+  next();
+}, ocrUpload.any(), (req, res, next) => {
+  // Log APRÈS Multer pour voir ce qui a été reçu
+  console.log('✅ ===== APRÈS MULTER =====');
+  console.log('📋 req.files:', req.files ? req.files.map(f => ({
+    fieldname: f.fieldname,
+    originalname: f.originalname,
+    mimetype: f.mimetype,
+    size: f.size
+  })) : 'null');
+  console.log('📋 req.files length:', req.files ? req.files.length : 0);
+  console.log('📋 req.body keys:', Object.keys(req.body || {}));
+  next();
+}, async (req, res) => {
+  try {
+    // 1. Vérifier qu'un fichier a été uploadé (avec upload.any(), les fichiers sont dans req.files)
+    if (!req.files || req.files.length === 0) {
+      console.error('❌ ===== AUCUN FICHIER REÇU =====');
+      console.error('📋 Body keys:', Object.keys(req.body || {}));
+      console.error('📋 Files array:', req.files);
+      return res.status(400).json({ 
+        error: 'NO_FILE',
+        message: 'Aucun fichier image fourni',
+        received: {
+          hasBody: !!req.body,
+          bodyKeys: Object.keys(req.body || {}),
+          hasFiles: !!req.files,
+          filesCount: req.files ? req.files.length : 0
+        }
+      });
+    }
+
+    // 2. Récupérer le premier fichier reçu
+    const uploadedFile = req.files[0];
+    
+    // Log du champ et du fichier reçu
+    console.log('✅ ===== FICHIER REÇU ET VALIDÉ =====');
+    console.log('🏷️  Nom du champ:', uploadedFile.fieldname);
+    console.log('📄 Nom du fichier:', uploadedFile.originalname);
+    console.log('📏 Taille:', uploadedFile.size, 'bytes');
+    console.log('🏷️  Type MIME:', uploadedFile.mimetype);
+
+    // 3. Vérifier que c'est bien une image
+    const allowedMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+    if (!allowedMimeTypes.includes(uploadedFile.mimetype)) {
+      console.error('❌ Type de fichier invalide:', uploadedFile.mimetype);
+      return res.status(400).json({ 
+        error: 'INVALID_FILE_TYPE',
+        message: 'Le fichier doit être une image (JPEG, PNG, WEBP)' 
+      });
+    }
+
+    // 4. Créer un FormData pour forwarder l'image vers n8n
+    // Format requis par n8n pour le Binary Property "file"
+    // n8n attend un champ multipart "file" avec le binaire de l'image
+    const formData = new FormData();
+    const blob = new Blob([uploadedFile.buffer], { type: uploadedFile.mimetype || 'image/jpeg' });
+    formData.append('file', blob, uploadedFile.originalname || 'image.jpg');
+
+    console.log('📤 ===== APPEL VERS WEBHOOK N8N OCR =====');
+    console.log('🔗 URL du webhook:', N8N_OCR_WEBHOOK_URL);
+    console.log('📋 Méthode: POST');
+    console.log('📦 Taille du fichier à envoyer:', uploadedFile.size, 'bytes');
+
+    // 4. Envoyer l'image au webhook n8n
+    let n8nResponse;
+    try {
+      n8nResponse = await fetch(N8N_OCR_WEBHOOK_URL, {
+        method: 'POST',
+        body: formData
+      });
+    } catch (fetchError) {
+      console.error('❌ ===== ERREUR LORS DE L\'APPEL VERS N8N =====');
+      console.error('🔴 Erreur réseau:', fetchError.message);
+      console.error('🔴 Stack:', fetchError.stack);
+      return res.status(500).json({ 
+        error: 'N8N_FETCH_ERROR',
+        message: 'Erreur réseau lors de l\'appel vers le webhook n8n',
+        details: fetchError.message
+      });
+    }
+
+    console.log('📥 ===== RÉPONSE REÇUE DU WEBHOOK N8N =====');
+    console.log('📊 Status HTTP:', n8nResponse.status);
+    console.log('📊 Status Text:', n8nResponse.statusText);
+    console.log('📋 Headers:', Object.fromEntries(n8nResponse.headers.entries()));
+
+    // 5. Vérifier le status de la réponse
+    if (!n8nResponse.ok) {
+      const errorText = await n8nResponse.text();
+      console.error('❌ ===== ERREUR DU WEBHOOK N8N =====');
+      console.error('🔴 Status HTTP:', n8nResponse.status);
+      console.error('🔴 Status Text:', n8nResponse.statusText);
+      console.error('🔴 Message d\'erreur:', errorText);
+      
+      // Retourner 404 si n8n retourne 404, sinon 500
+      const statusCode = n8nResponse.status === 404 ? 404 : (n8nResponse.status || 500);
+      return res.status(statusCode).json({ 
+        error: 'N8N_ERROR',
+        message: 'Erreur lors du traitement OCR par n8n',
+        n8nStatus: n8nResponse.status,
+        n8nStatusText: n8nResponse.statusText,
+        details: errorText
+      });
+    }
+
+    // 6. Lire la réponse JSON de n8n
+    let responseData;
+    try {
+      responseData = await n8nResponse.json();
+      console.log('✅ ===== RÉPONSE OCR REÇUE AVEC SUCCÈS =====');
+      console.log('📄 Type de réponse:', typeof responseData);
+      console.log('📄 Clés de la réponse:', Object.keys(responseData || {}));
+    } catch (jsonError) {
+      console.error('❌ ===== ERREUR LORS DU PARSING JSON =====');
+      console.error('🔴 Erreur:', jsonError.message);
+      const rawText = await n8nResponse.text();
+      console.error('🔴 Réponse brute:', rawText);
+      return res.status(500).json({ 
+        error: 'N8N_JSON_PARSE_ERROR',
+        message: 'Erreur lors du parsing de la réponse JSON de n8n',
+        details: jsonError.message,
+        rawResponse: rawText
+      });
+    }
+
+    // 7. Retourner la réponse JSON telle quelle au frontend
+    console.log('✅ ===== ENVOI DE LA RÉPONSE AU FRONTEND =====');
+    res.json(responseData);
+
+  } catch (error) {
+    console.error('❌ ===== ERREUR GÉNÉRALE LORS DU TRAITEMENT OCR =====');
+    console.error('🔴 Erreur:', error.message);
+    console.error('🔴 Stack:', error.stack);
+    res.status(500).json({ 
+      error: 'OCR_PROCESSING_ERROR',
+      message: 'Erreur lors du traitement de l\'image OCR',
+      details: error.message 
+    });
+  }
+});
+
+// Route POST /api/ordonnances/create - Créer une ordonnance OCR manuscrite
+app.post('/api/ordonnances/create', (req, res) => {
+  console.log('📝 ===== CRÉATION D\'ORDONNANCE OCR MANUSCRITE =====');
+  console.log('📥 Body reçu:', {
+    source: req.body?.source,
+    hasRawText: !!req.body?.rawText,
+    rawTextLength: req.body?.rawText?.length,
+    createdAt: req.body?.createdAt
+  });
+
+  try {
+    // 1. Validation des données
+    const { source, rawText, createdAt } = req.body;
+
+    // Vérifier que source est "ocr_manuscrit"
+    if (!source || source !== 'ocr_manuscrit') {
+      console.error('❌ Source invalide:', source);
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_SOURCE',
+        message: 'Le champ source doit être "ocr_manuscrit"'
+      });
+    }
+
+    // Vérifier que rawText n'est pas vide
+    if (!rawText || typeof rawText !== 'string' || rawText.trim().length === 0) {
+      console.error('❌ rawText vide ou invalide');
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_RAWTEXT',
+        message: 'Le champ rawText est requis et ne peut pas être vide'
+      });
+    }
+
+    // Valider createdAt (optionnel, utiliser la date actuelle si non fourni)
+    let validCreatedAt = createdAt;
+    if (!createdAt || !Date.parse(createdAt)) {
+      console.log('⚠️  Date non fournie ou invalide, utilisation de la date actuelle');
+      validCreatedAt = new Date().toISOString();
+    }
+
+    // 2. Créer l'ordonnance
+    const ordonnance = {
+      id: randomUUID(),
+      source: 'ocr_manuscrit',
+      rawText: rawText.trim(),
+      status: 'a_recuperer',
+      createdAt: validCreatedAt
+    };
+
+    // 3. Stocker l'ordonnance (en mémoire pour l'instant)
+    ordonnances.push(ordonnance);
+
+    console.log('✅ ===== ORDONNANCE CRÉÉE AVEC SUCCÈS =====');
+    console.log('🆔 ID:', ordonnance.id);
+    console.log('📄 Source:', ordonnance.source);
+    console.log('📏 Longueur rawText:', ordonnance.rawText.length);
+    console.log('📅 Créée le:', ordonnance.createdAt);
+    console.log('📊 Total ordonnances:', ordonnances.length);
+
+    // 4. Retourner la réponse
+    res.status(201).json({
+      success: true,
+      ordonnance: ordonnance
+    });
+
+  } catch (error) {
+    console.error('❌ ===== ERREUR LORS DE LA CRÉATION D\'ORDONNANCE =====');
+    console.error('🔴 Erreur:', error.message);
+    console.error('🔴 Stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: 'CREATION_ERROR',
+      message: 'Erreur lors de la création de l\'ordonnance',
+      details: error.message
+    });
+  }
+});
+
+/**
+ * Analyse un texte brut d'ordonnance (OCR ou PDF) et retourne un JSON structuré strict
+ * @param {string} rawText - Texte brut extrait de l'OCR ou du PDF
+ * @returns {Object} JSON structuré selon le schéma Medicalia strict
+ */
+function analyzeOrdonnanceText(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    return {
+      doctor: { name: "", speciality: "", rpps: "" },
+      patient: { name: "", birthDate: "" },
+      prescription: [],
+      additionalInstructions: "",
+      appointments: [],
+      issueDate: "",
+      confidenceScore: 0.0,
+      source: "OCR"
+    };
+  }
+
+  const text = rawText.trim();
+  const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+  const textLower = text.toLowerCase();
+  
+  let confidenceScore = 0.0;
+  let foundElements = 0;
+  const totalElements = 6; // doctor, patient, prescription, instructions, appointments, issueDate
+
+  // ===== EXTRACTION DU MÉDECIN =====
+  let doctorName = "";
+  let doctorSpeciality = "";
+  let doctorRpps = "";
+
+  // Chercher le nom du médecin
+  const doctorMarkers = ['dr ', 'docteur', 'médecin', 'prescripteur', 'dr.', 'doct.'];
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i].toLowerCase();
+    
+    for (const marker of doctorMarkers) {
+      if (lineLower.includes(marker)) {
+        let extracted = lines[i];
+        const markerIndex = extracted.toLowerCase().indexOf(marker);
+        if (markerIndex !== -1) {
+          extracted = extracted.substring(markerIndex + marker.length).trim();
+        }
+        extracted = extracted.replace(/^[:\-.,;]\s*/, '').trim();
+        
+        const words = extracted.split(/\s+/).filter(w => w.length > 0);
+        if (words.length >= 1) {
+          doctorName = words.slice(0, 3).join(' ').trim();
+          foundElements++;
+          break;
+        }
+      }
+    }
+    if (doctorName) break;
+  }
+
+  // Chercher la spécialité
+  const specialityMarkers = ['spécialité', 'specialite', 'spécialiste en', 'médecin généraliste', 'généraliste'];
+  for (const line of lines) {
+    const lineLower = line.toLowerCase();
+    for (const marker of specialityMarkers) {
+      if (lineLower.includes(marker)) {
+        const index = lineLower.indexOf(marker);
+        doctorSpeciality = line.substring(index + marker.length).trim().replace(/^[:\-.,;]\s*/, '');
+        if (doctorSpeciality) foundElements++;
+        break;
+      }
+    }
+    if (doctorSpeciality) break;
+  }
+
+  // Chercher le RPPS (numéro à 11 chiffres)
+  const rppsMatch = text.match(/\b(\d{11})\b/);
+  if (rppsMatch) {
+    doctorRpps = rppsMatch[1];
+  }
+
+  // ===== EXTRACTION DU PATIENT =====
+  let patientName = "";
+  let patientBirthDate = "";
+
+  const patientMarkers = [
+    'identification du patient',
+    'patient:',
+    'patient :',
+    'nom:',
+    'nom :',
+    'nom du patient',
+    'm.',
+    'mme',
+    'melle',
+    'monsieur',
+    'madame'
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i].toLowerCase();
+    
+    for (const marker of patientMarkers) {
+      if (lineLower.includes(marker)) {
+        let extracted = lines[i];
+        const markerIndex = extracted.toLowerCase().indexOf(marker);
+        if (markerIndex !== -1) {
+          extracted = extracted.substring(markerIndex + marker.length).trim();
+        }
+        
+        if (!extracted && i + 1 < lines.length) {
+          extracted = lines[i + 1];
+        }
+        
+        extracted = extracted
+          .replace(/^(m\.|mme|melle|monsieur|madame|mademoiselle)\s*/i, '')
+          .replace(/^nom\s*:?\s*/i, '')
+          .trim();
+        
+        if (extracted && extracted.length > 1) {
+          patientName = extracted;
+          foundElements++;
+          break;
+        }
+      }
+    }
+    if (patientName) break;
+  }
+
+  // Chercher la date de naissance (format DD/MM/YYYY, DD-MM-YYYY, ou DD.MM.YYYY)
+  const birthDatePatterns = [
+    /(?:né|née|naissance|né le|née le)\s*:?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})/i,
+    /(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})/
+  ];
+  
+  for (const pattern of birthDatePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      patientBirthDate = match[1];
+      foundElements++;
+      break;
+    }
+  }
+
+  // ===== EXTRACTION DES PRESCRIPTIONS =====
+  const prescription = [];
+  
+  const medicationIndicators = [
+    /\d+\s*(mg|ml|g|µg|mcg)\b/i,
+    /comprimé/i,
+    /gélule/i,
+    /cp\b/i,
+    /fois\s+par\s+jour/i,
+    /\d+\s*(fois|fois\/jour)/i,
+    /matin|midi|soir/i,
+    /jour|jours|semaine|semaines|mois/i
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineLower = line.toLowerCase();
+    
+    const hasMedicationIndicator = medicationIndicators.some(pattern => 
+      typeof pattern === 'string' ? lineLower.includes(pattern) : pattern.test(line)
+    );
+
+    if (hasMedicationIndicator) {
+      const words = line.split(/\s+/);
+      let medicament = "";
+      let dosage = "";
+      let posologie = "";
+      let duration = "";
+
+      // Nom du médicament (premier mot capitalisé ou plusieurs mots en majuscules)
+      for (let j = 0; j < words.length; j++) {
+        const word = words[j];
+        if (word.match(/^[A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþ]+/) ||
+            word.match(/^[A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ]{2,}$/)) {
+          let nameWords = [word];
+          for (let k = j + 1; k < words.length && k < j + 4; k++) {
+            if (words[k].match(/^\d/) || words[k].match(/(mg|ml|g|comprimé|gélule)/i)) {
+              break;
+            }
+            nameWords.push(words[k]);
+          }
+          medicament = nameWords.join(' ').trim();
+          break;
+        }
+      }
+
+      // Dosage (mg, ml, g, comprimé, gélule)
+      const dosageMatch = line.match(/(\d+\s*(?:mg|ml|g|µg|mcg|comprimé|gélule|cp)\b)/i);
+      if (dosageMatch) {
+        dosage = dosageMatch[1].trim();
+      }
+
+      // Posologie (fréquence)
+      const posologiePatterns = [
+        /(\d+\s*fois\s*par\s*jour)/i,
+        /(\d+\s*fois\/jour)/i,
+        /(matin|midi|soir)/i,
+        /(\d+\s*fois)/i,
+        /(avant|après)\s*(?:les\s*)?(?:repas|repas)/i
+      ];
+      
+      for (const pattern of posologiePatterns) {
+        const match = line.match(pattern);
+        if (match) {
+          posologie = match[1] || match[0];
+          break;
+        }
+      }
+
+      // Duration (jours, semaines, mois)
+      const durationMatch = line.match(/(\d+)\s*(jour|jours|semaine|semaines|mois)/i);
+      if (durationMatch) {
+        duration = `${durationMatch[1]} ${durationMatch[2]}`;
+      }
+
+      // Ajouter la prescription si on a au moins un médicament ou un dosage
+      if (medicament || dosage) {
+        prescription.push({
+          medicament: medicament || "",
+          dosage: dosage || "",
+          posologie: posologie || "",
+          duration: duration || ""
+        });
+      }
+    }
+  }
+
+  if (prescription.length > 0) {
+    foundElements++;
+  }
+
+  // ===== EXTRACTION DES INSTRUCTIONS ADDITIONNELLES =====
+  let additionalInstructions = "";
+  
+  const instructionMarkers = [
+    'instructions',
+    'observations',
+    'remarques',
+    'note',
+    'précautions',
+    'conseils'
+  ];
+
+  let instructionStartIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i].toLowerCase();
+    for (const marker of instructionMarkers) {
+      if (lineLower.includes(marker)) {
+        instructionStartIndex = i;
+        break;
+      }
+    }
+    if (instructionStartIndex !== -1) break;
+  }
+
+  if (instructionStartIndex !== -1) {
+    additionalInstructions = lines.slice(instructionStartIndex).join(' ').trim();
+    foundElements++;
+  }
+
+  // ===== EXTRACTION DES RENDEZ-VOUS =====
+  const appointments = [];
+  
+  const appointmentPatterns = [
+    /(?:rdv|rendez-vous|consultation)\s*:?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})/i,
+    /(?:rdv|rendez-vous|consultation)\s*:?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})\s*(?:à|@)?\s*(\d{1,2}[:h]\d{2})/i
+  ];
+
+  for (const pattern of appointmentPatterns) {
+    const matches = text.matchAll(new RegExp(pattern.source, 'gi'));
+    for (const match of matches) {
+      appointments.push(match[0].trim());
+    }
+  }
+
+  if (appointments.length > 0) {
+    foundElements++;
+  }
+
+  // ===== EXTRACTION DE LA DATE D'ÉMISSION =====
+  let issueDate = "";
+  
+  const datePatterns = [
+    /(?:date|le)\s*:?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})/i,
+    /(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})/
+  ];
+
+  // Chercher la date la plus récente (probablement la date d'émission)
+  const allDates = [];
+  for (const pattern of datePatterns) {
+    const matches = text.matchAll(new RegExp(pattern.source, 'gi'));
+    for (const match of matches) {
+      allDates.push(match[1] || match[0]);
+    }
+  }
+
+  if (allDates.length > 0) {
+    // Prendre la dernière date trouvée (généralement la date d'émission)
+    issueDate = allDates[allDates.length - 1];
+    foundElements++;
+  }
+
+  // ===== CALCUL DU SCORE DE CONFIANCE =====
+  confidenceScore = foundElements / totalElements;
+  
+  // Bonus si on a plusieurs prescriptions
+  if (prescription.length > 1) {
+    confidenceScore = Math.min(1.0, confidenceScore + 0.1);
+  }
+  
+  // Bonus si on a des informations complètes
+  if (doctorName && patientName && prescription.length > 0) {
+    confidenceScore = Math.min(1.0, confidenceScore + 0.1);
+  }
+
+  // ===== RETOUR DU JSON STRICT =====
+  return {
+    doctor: {
+      name: doctorName,
+      speciality: doctorSpeciality,
+      rpps: doctorRpps
+    },
+    patient: {
+      name: patientName,
+      birthDate: patientBirthDate
+    },
+    prescription: prescription,
+    additionalInstructions: additionalInstructions,
+    appointments: appointments,
+    issueDate: issueDate,
+    confidenceScore: Math.round(confidenceScore * 100) / 100, // Arrondir à 2 décimales
+    source: "OCR"
+  };
+}
+
+/**
+ * Normalise une ordonnance structurée au format canonique strict
+ * Garantit que tous les champs sont présents, même s'ils sont vides
+ * @param {Object} structured - Données structurées (peuvent être partielles)
+ * @param {string} rawText - Texte OCR brut
+ * @returns {Object} Ordonnance normalisée au format canonique strict
+ */
+function normalizeOrdonnance(structured, rawText = '') {
+  // Normaliser le docteur
+  const doctor = {
+    name: structured?.doctor?.name || 
+           structured?.doctorName || 
+           '',
+    speciality: structured?.doctor?.speciality || 
+                structured?.speciality || 
+                '',
+    rpps: structured?.doctor?.rpps || 
+          structured?.rpps || 
+          ''
+  };
+
+  // Normaliser le patient
+  const patient = {
+    name: structured?.patient?.name || 
+           structured?.patientName || 
+           '',
+    birthDate: structured?.patient?.birthDate || 
+               structured?.birthDate || 
+               ''
+  };
+
+  // Normaliser les prescriptions
+  let prescription = [];
+  
+  if (Array.isArray(structured?.prescription)) {
+    prescription = structured.prescription.map(p => ({
+      medicament: p.medicament || p.name || p.nom || '',
+      dosage: p.dosage || '',
+      posologie: p.posologie || p.frequency || p.frequence || '',
+      duration: p.duration || p.duree || ''
+    }));
+  } else if (Array.isArray(structured?.medications) || Array.isArray(structured?.medicaments)) {
+    const meds = structured.medications || structured.medicaments;
+    prescription = meds.map(p => ({
+      medicament: p.medicament || p.name || p.nom || '',
+      dosage: p.dosage || '',
+      posologie: p.posologie || p.frequency || p.frequence || '',
+      duration: p.duration || p.duree || ''
+    }));
+  }
+
+  // Normaliser les autres champs
+  const additionalInstructions = structured?.additionalInstructions || 
+                                 structured?.instructions || 
+                                 structured?.observations || 
+                                 '';
+
+  const appointments = Array.isArray(structured?.appointments) 
+    ? structured.appointments 
+    : [];
+
+  const issueDate = structured?.issueDate || 
+                    structured?.date || 
+                    structured?.datePrescription || 
+                    '';
+
+  // Normaliser le score de confiance (doit être un nombre entre 0 et 1)
+  let confidenceScore = 0;
+  if (typeof structured?.confidenceScore === 'number') {
+    confidenceScore = Math.max(0, Math.min(1, structured.confidenceScore));
+  } else if (typeof structured?.confidenceScore === 'string') {
+    const parsed = parseFloat(structured.confidenceScore);
+    confidenceScore = isNaN(parsed) ? 0 : Math.max(0, Math.min(1, parsed));
+  }
+
+  // Retourner l'ordonnance normalisée au format canonique strict
+  return {
+    doctor,
+    patient,
+    prescription,
+    additionalInstructions,
+    appointments,
+    issueDate,
+    confidenceScore: Math.round(confidenceScore * 100) / 100, // Arrondir à 2 décimales
+    source: 'OCR',
+    rawText: typeof rawText === 'string' ? rawText : ''
+  };
+}
+
+/**
+ * Mappe le texte OCR brut vers les champs métier de l'ordonnance (déterministe)
+ * @param {string} ocrText - Texte brut extrait de l'OCR
+ * @returns {Object} Champs structurés : { patientName, doctorName, medications }
+ */
+function mapOcrToOrdonnanceFields(ocrText) {
+  if (!ocrText || typeof ocrText !== 'string') {
+    return {
+      patientName: 'Non renseigné',
+      doctorName: 'Non renseigné',
+      medications: []
+    };
+  }
+
+  const text = ocrText.trim();
+  const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+  const textLower = text.toLowerCase();
+
+  // ===== EXTRACTION DU PATIENT =====
+  let patientName = null;
+  
+  // Chercher après "Identification du patient", "Patient", "Nom"
+  const patientMarkers = [
+    'identification du patient',
+    'patient:',
+    'patient :',
+    'nom:',
+    'nom :',
+    'nom du patient',
+    'm.',
+    'mme',
+    'melle'
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i].toLowerCase();
+    
+    for (const marker of patientMarkers) {
+      if (lineLower.includes(marker)) {
+        // Prendre la ligne suivante ou extraire de la ligne actuelle
+        let extracted = lines[i];
+        
+        // Si la ligne contient le marqueur, extraire ce qui suit
+        const markerIndex = extracted.toLowerCase().indexOf(marker);
+        if (markerIndex !== -1) {
+          extracted = extracted.substring(markerIndex + marker.length).trim();
+        }
+        
+        // Si vide, prendre la ligne suivante
+        if (!extracted && i + 1 < lines.length) {
+          extracted = lines[i + 1];
+        }
+        
+        // Nettoyer : supprimer titres inutiles, garder le nom
+        extracted = extracted
+          .replace(/^(m\.|mme|melle|monsieur|madame|mademoiselle)\s*/i, '')
+          .replace(/^nom\s*:?\s*/i, '')
+          .trim();
+        
+        if (extracted && extracted.length > 1) {
+          patientName = extracted;
+          break;
+        }
+      }
+    }
+    
+    if (patientName) break;
+  }
+
+  // Si pas trouvé, chercher des patterns de nom (M. Nom, Mme Nom)
+  if (!patientName) {
+    for (const line of lines) {
+      const nameMatch = line.match(/^(m\.|mme|melle|monsieur|madame)\s+([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþ\s-]+)/i);
+      if (nameMatch && nameMatch[2]) {
+        patientName = nameMatch[2].trim();
+        break;
+      }
+    }
+  }
+
+  patientName = patientName || 'Non renseigné';
+
+  // ===== EXTRACTION DU MÉDECIN =====
+  let doctorName = null;
+
+  // Chercher après "Dr", "Docteur", "Médecin"
+  const doctorMarkers = ['dr ', 'docteur', 'médecin', 'prescripteur'];
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i].toLowerCase();
+    
+    for (const marker of doctorMarkers) {
+      if (lineLower.includes(marker)) {
+        let extracted = lines[i];
+        
+        // Extraire ce qui suit le marqueur
+        const markerIndex = extracted.toLowerCase().indexOf(marker);
+        if (markerIndex !== -1) {
+          extracted = extracted.substring(markerIndex + marker.length).trim();
+        }
+        
+        // Nettoyer : supprimer ponctuation et caractères inutiles
+        extracted = extracted
+          .replace(/^[:\-.,;]\s*/, '')
+          .replace(/\s*[:\-.,;]\s*$/, '')
+          .trim();
+        
+        // Prendre les 2-3 premiers mots (nom du médecin)
+        const words = extracted.split(/\s+/).filter(w => w.length > 0);
+        if (words.length >= 1) {
+          doctorName = words.slice(0, 3).join(' ').trim();
+          break;
+        }
+      }
+    }
+    
+    if (doctorName) break;
+  }
+
+  doctorName = doctorName || 'Non renseigné';
+
+  // ===== EXTRACTION DES MÉDICAMENTS =====
+  const medications = [];
+
+  // Détecter les lignes contenant des médicaments
+  const medicationIndicators = [
+    /\d+\s*(mg|ml|g|µg|mcg)\b/i,
+    /comprimé/i,
+    /gélule/i,
+    /cp\b/i,
+    /fois\s+par\s+jour/i,
+    /\d+\s*(fois|fois\/jour)/i,
+    /matin|midi|soir/i,
+    /jour|jours|semaine|semaines|mois/i
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineLower = line.toLowerCase();
+    
+    // Vérifier si la ligne contient des indicateurs de médicament
+    const hasMedicationIndicator = medicationIndicators.some(pattern => 
+      typeof pattern === 'string' ? lineLower.includes(pattern) : pattern.test(line)
+    );
+
+    if (hasMedicationIndicator) {
+      // Extraire le nom du médicament (premier mot capitalisé ou plusieurs mots en majuscules)
+      const words = line.split(/\s+/);
+      let name = '';
+      let dosage = '';
+      let frequency = '';
+      let duration = null;
+
+      // Nom : chercher un mot capitalisé ou en majuscules au début
+      for (let j = 0; j < words.length; j++) {
+        const word = words[j];
+        if (word.match(/^[A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþ]+/) ||
+            word.match(/^[A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ]{2,}$/)) {
+          // Prendre ce mot et les suivants jusqu'à un nombre ou indicateur de dosage
+          let nameWords = [word];
+          for (let k = j + 1; k < words.length && k < j + 4; k++) {
+            if (words[k].match(/^\d/) || words[k].match(/(mg|ml|g|comprimé|gélule)/i)) {
+              break;
+            }
+            nameWords.push(words[k]);
+          }
+          name = nameWords.join(' ').trim();
+          break;
+        }
+      }
+
+      // Dosage : chercher mg, ml, g, comprimé, gélule
+      const dosageMatch = line.match(/(\d+\s*(mg|ml|g|µg|mcg|comprimé|gélule|cp)\b)/i);
+      if (dosageMatch) {
+        dosage = dosageMatch[1].trim();
+      }
+
+      // Frequency : chercher "fois par jour", "matin", "soir", etc.
+      const frequencyPatterns = [
+        /(\d+\s*fois\s*par\s*jour)/i,
+        /(\d+\s*fois\/jour)/i,
+        /(matin|midi|soir)/i,
+        /(\d+\s*fois)/i
+      ];
+      
+      for (const pattern of frequencyPatterns) {
+        const match = line.match(pattern);
+        if (match) {
+          frequency = match[1].trim();
+          break;
+        }
+      }
+
+      // Duration : chercher "jours", "semaines", "mois"
+      const durationMatch = line.match(/(\d+)\s*(jour|jours|semaine|semaines|mois)/i);
+      if (durationMatch) {
+        duration = `${durationMatch[1]} ${durationMatch[2]}`;
+      }
+
+      // Si on a au moins un nom ou un dosage, créer le médicament
+      if (name || dosage) {
+        medications.push({
+          name: name || 'Médicament non identifié',
+          dosage: dosage || '',
+          frequency: frequency || '',
+          duration: duration
+        });
+      }
+    }
+  }
+
+  const result = {
+    patientName,
+    doctorName,
+    medications: medications.length > 0 ? medications : []
+  };
+
+  console.log('[OCR MAP] Champs mappés :', {
+    patientName: result.patientName,
+    doctorName: result.doctorName,
+    medications: result.medications
+  });
+
+  return result;
+}
+
+/**
+ * Structure une ordonnance OCR brute via l'IA (n8n) - DÉPRÉCIÉ, utiliser mapOcrToOrdonnanceFields
+ * @param {string} rawText - Texte brut extrait de l'OCR
+ * @returns {Promise<Object>} Ordonnance structurée au format Medicalia
+ */
+async function structureOcrOrdonnance(rawText) {
+  console.log('[OCR STRUCT] Début de la restructuration OCR via IA');
+  
+  try {
+    // 1. Appeler le webhook n8n avec le texte OCR brut
+    const n8nData = {
+      text: rawText.trim()
+    };
+
+    console.log('[OCR STRUCT] Appel n8n avec texte OCR brut...');
+    const n8nResponse = await fetch(N8N_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(n8nData)
+    });
+
+    if (!n8nResponse.ok) {
+      const errorText = await n8nResponse.text();
+      console.error('[OCR STRUCT] ❌ Erreur HTTP n8n:', n8nResponse.status, errorText);
+      throw new Error(`n8n returned status ${n8nResponse.status}`);
+    }
+
+    // 2. Lire la réponse brute
+    const rawResponse = await n8nResponse.text();
+    
+    if (!rawResponse || rawResponse.trim() === "") {
+      throw new Error('Réponse n8n vide');
+    }
+
+    // 3. Parser la réponse JSON
+    let parsed;
+    try {
+      parsed = JSON.parse(rawResponse);
+    } catch (e) {
+      console.error('[OCR STRUCT] ❌ Erreur parsing réponse n8n:', e);
+      throw new Error('Réponse n8n invalide (JSON)');
+    }
+
+    // 4. Extraire le champ result (qui contient un JSON stringifié)
+    let structuredData;
+    if (parsed.result) {
+      try {
+        structuredData = JSON.parse(parsed.result);
+      } catch (e) {
+        // Si result n'est pas une string JSON, utiliser parsed directement
+        structuredData = parsed;
+      }
+    } else {
+      structuredData = parsed;
+    }
+
+    // 5. Transformer la réponse n8n au format Medicalia standard
+    const ordonnanceStructured = {
+      doctorName: structuredData.meta?.prescripteur?.nom || 
+                  structuredData.prescripteur?.nom || 
+                  structuredData.doctorName || 
+                  null,
+      patientName: structuredData.patient?.nom || 
+                   structuredData.patientName || 
+                   null,
+      medications: []
+    };
+
+    // 6. Transformer les médicaments
+    if (structuredData.medicaments && Array.isArray(structuredData.medicaments)) {
+      ordonnanceStructured.medications = structuredData.medicaments.map(med => ({
+        name: med.nom || med.name || '',
+        dosage: med.posologie || med.dosage || '',
+        frequency: med.frequence || med.frequency || '',
+        duration: med.duree || med.duration || null
+      }));
+    } else if (structuredData.medications && Array.isArray(structuredData.medications)) {
+      ordonnanceStructured.medications = structuredData.medications.map(med => ({
+        name: med.name || '',
+        dosage: med.dosage || '',
+        frequency: med.frequency || '',
+        duration: med.duration || null
+      }));
+    }
+
+    console.log('[OCR STRUCT] Ordonnance OCR restructurée');
+    console.log('[OCR STRUCT] Médecin:', ordonnanceStructured.doctorName);
+    console.log('[OCR STRUCT] Patient:', ordonnanceStructured.patientName);
+    console.log('[OCR STRUCT] Médicaments:', ordonnanceStructured.medications.length);
+
+    return ordonnanceStructured;
+
+  } catch (error) {
+    console.error('[OCR STRUCT] ❌ Erreur lors de la restructuration:', error.message);
+    throw error;
+  }
+}
+
+// Route POST /api/ordonnance/ocr - Créer une ordonnance issue de l'OCR manuscrit
+app.post('/api/ordonnance/ocr', async (req, res) => {
+  console.log('[OCR ORD] POST /api/ordonnance/ocr appelée');
+
+  try {
+    // 1. Validation des données
+    const { source, rawText, createdAt } = req.body;
+
+    // Vérifier que rawText n'est pas vide
+    if (!rawText || typeof rawText !== 'string' || rawText.trim().length === 0) {
+      console.error('[OCR ORD] ❌ rawText vide ou invalide');
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_RAWTEXT',
+        message: 'Le champ rawText est requis et ne peut pas être vide'
+      });
+    }
+
+    // Valider createdAt (optionnel, utiliser la date actuelle si non fourni)
+    let validCreatedAt = createdAt;
+    if (!createdAt || !Date.parse(createdAt)) {
+      validCreatedAt = new Date().toISOString();
+    }
+
+    // 2. Mapper le texte OCR brut vers les champs métier (déterministe)
+    const structuredData = mapOcrToOrdonnanceFields(rawText);
+
+    // 3. Créer l'ordonnance avec le format structuré standard via la fonction centrale
+    // Les valeurs sont déjà garanties par mapOcrToOrdonnanceFields (pas de null/undefined)
+    const ordonnance = createOrdonnance({
+      source: source || 'ocr_manuscrit',
+      rawText: rawText.trim(),
+      doctorName: structuredData.doctorName,
+      patientName: structuredData.patientName,
+      medications: structuredData.medications,
+      status: 'a_recuperer',
+      createdAt: validCreatedAt
+    });
+
+    console.log('[ORDONNANCE] OCR visible dans Mes ordonnances');
+
+    console.log('[OCR ORD] Ordonnance OCR créée avec succès');
+    console.log('[OCR ORD] ID:', ordonnance.id);
+    console.log('[OCR ORD] Status:', ordonnance.status);
+    console.log('[OCR ORD] Médecin:', ordonnance.doctorName);
+    console.log('[OCR ORD] Patient:', ordonnance.patientName);
+    console.log('[OCR ORD] Médicaments:', ordonnance.medications.length);
+    console.log('[OCR ORD] Total ordonnances dans le store:', ordonnances.length);
+
+    // 5. Retourner la réponse
+    res.status(200).json({
+      success: true,
+      ordonnance: ordonnance
+    });
+
+  } catch (error) {
+    console.error('[OCR ORD] ❌ Erreur lors de la création:', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'CREATION_ERROR',
+      message: 'Erreur lors de la création de l\'ordonnance',
+      details: error.message
+    });
+  }
+});
+
+// Route GET /api/ordonnances - Récupérer toutes les ordonnances (PDF et OCR)
+
+// Route POST /ocr-photo - OCR avec Mistral + Structuration IA avec OpenAI
+// 
+// Variables d'environnement requises:
+// - MISTRAL_API_KEY: Clé API Mistral pour l'OCR
+// - OPENAI_API_KEY: Clé API OpenAI pour la structuration (optionnel, fallback déterministe si absent)
+//
+// Body attendu: { "image": "base64_string" }
+// Retourne: JSON structuré selon le schéma Medicalia strict
+app.post('/ocr-photo', async (req, res) => {
+  console.log('[OCR PHOTO] POST /ocr-photo appelée');
+
+  try {
+    const { image } = req.body;
+
+    // Validation
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_IMAGE',
+        message: 'Le champ image (base64) est requis'
+      });
+    }
+
+    // 1️⃣ OCR Mistral
+    console.log('[OCR PHOTO] Appel OCR Mistral...');
+    const mistralApiKey = process.env.MISTRAL_API_KEY;
+    if (!mistralApiKey) {
+      console.error('[OCR PHOTO] ❌ MISTRAL_API_KEY non définie');
+      return res.status(500).json({
+        success: false,
+        error: 'MISSING_API_KEY',
+        message: 'MISTRAL_API_KEY non configurée'
+      });
+    }
+
+    // Préparer l'image base64 avec le préfixe data URL si nécessaire
+    let imageDataUrl = image;
+    if (!imageDataUrl.startsWith('data:')) {
+      imageDataUrl = `data:image/jpeg;base64,${image}`;
+    }
+
+    // Appel à l'API Mistral Vision officielle
+    const ocrRes = await fetch('https://api.mistral.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${mistralApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'mistral-large-latest',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut sans commentaire.' },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: imageDataUrl
+                }
+              }
+            ]
+          }
+        ]
+      })
+    });
+
+    if (!ocrRes.ok) {
+      const errorText = await ocrRes.text();
+      console.error('[OCR PHOTO] ❌ Erreur OCR Mistral:', ocrRes.status, errorText);
+      throw new Error(`OCR Mistral failed: ${ocrRes.status}`);
+    }
+
+    const ocrData = await ocrRes.json();
+    // Extraire le texte depuis choices[0].message.content
+    const text = ocrData.choices?.[0]?.message?.content || '';
+
+    if (!text || text.trim().length === 0) {
+      console.warn('[OCR PHOTO] ⚠️ Texte OCR vide');
+      return res.status(400).json({
+        success: false,
+        error: 'EMPTY_OCR_TEXT',
+        message: 'Aucun texte extrait de l\'image'
+      });
+    }
+
+    console.log('[OCR PHOTO] Texte OCR extrait:', text.substring(0, 100) + '...');
+
+    // 2️⃣ IA Structuration avec OpenAI
+    console.log('[OCR PHOTO] Appel structuration OpenAI...');
+    // Utiliser EXCLUSIVEMENT app.locals.OPENAI_API_KEY (lue au démarrage)
+    const OPENAI_KEY = req.app.locals.OPENAI_API_KEY;
+    if (!OPENAI_KEY) {
+      console.error('[OCR PHOTO] ❌ OPENAI_API_KEY absente (app.locals)');
+      // Fallback: utiliser la fonction déterministe
+      console.log('[OCR PHOTO] ⚠️ Utilisation de la fonction déterministe (fallback)');
+      const structured = analyzeOrdonnanceText(text);
+      const normalized = normalizeOrdonnance(structured, text);
+      return res.status(200).json(normalized);
+    }
+
+    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o', // Utiliser gpt-4o au lieu de gpt-4.1 (qui n'existe pas)
+        temperature: 0.1,
+        messages: [
+          {
+            role: 'system',
+            content: `Tu es un assistant médical expert en ordonnances françaises. 
+Retourne UNIQUEMENT un JSON valide respectant EXACTEMENT ce schéma :
+
+{
+  "doctor": {
+    "name": "",
+    "speciality": "",
+    "rpps": ""
+  },
+  "patient": {
+    "name": "",
+    "birthDate": ""
+  },
+  "prescription": [
+    {
+      "medicament": "",
+      "dosage": "",
+      "posologie": "",
+      "duration": ""
+    }
+  ],
+  "additionalInstructions": "",
+  "appointments": [],
+  "issueDate": "",
+  "confidenceScore": 0.0,
+  "source": "OCR"
+}
+
+Règles strictes:
+- Ne jamais inventer d'information
+- Laisser les champs vides ("") si inconnus
+- Extraire chaque médicament individuellement
+- Calculer confidenceScore entre 0 et 1 selon la clarté du texte
+- Retourner UNIQUEMENT le JSON, sans texte supplémentaire`
+          },
+          {
+            role: 'user',
+            content: text
+          }
+        ],
+        response_format: { type: 'json_object' } // Forcer le format JSON
+      })
+    });
+
+    if (!aiRes.ok) {
+      const errorText = await aiRes.text();
+      console.error('[OCR PHOTO] ❌ Erreur OpenAI:', aiRes.status, errorText);
+      // Fallback: utiliser la fonction déterministe
+      console.log('[OCR PHOTO] ⚠️ Utilisation de la fonction déterministe (fallback)');
+      const structured = analyzeOrdonnanceText(text);
+      const normalized = normalizeOrdonnance(structured, text);
+      return res.status(200).json(normalized);
+    }
+
+    const aiData = await aiRes.json();
+    let structured;
+
+    try {
+      // Essayer de parser le contenu JSON
+      const content = aiData.choices[0].message.content;
+      structured = typeof content === 'string' ? JSON.parse(content) : content;
+    } catch (parseError) {
+      console.error('[OCR PHOTO] ❌ Erreur parsing JSON OpenAI:', parseError.message);
+      // Fallback: utiliser la fonction déterministe
+      console.log('[OCR PHOTO] ⚠️ Utilisation de la fonction déterministe (fallback)');
+      structured = analyzeOrdonnanceText(text);
+    }
+
+    // Valider le format de sortie
+    if (!structured.doctor || !structured.patient || !Array.isArray(structured.prescription)) {
+      console.warn('[OCR PHOTO] ⚠️ Format OpenAI invalide, utilisation du fallback');
+      structured = analyzeOrdonnanceText(text);
+    }
+
+    // Normaliser l'ordonnance au format canonique strict
+    const normalized = normalizeOrdonnance(structured, text);
+
+    console.log('[OCR PHOTO] ✅ Structuration terminée');
+    console.log('[OCR PHOTO] Score de confiance:', normalized.confidenceScore);
+    console.log('[OCR PHOTO] Médecin:', normalized.doctor.name);
+    console.log('[OCR PHOTO] Patient:', normalized.patient.name);
+    console.log('[OCR PHOTO] Prescriptions:', normalized.prescription.length);
+
+    res.status(200).json(normalized);
+
+  } catch (error) {
+    console.error('[OCR PHOTO] ❌ Erreur:', error.message);
+    console.error('[OCR PHOTO] Stack:', error.stack);
+    
+    // En cas d'erreur, essayer le fallback déterministe si on a le texte
+    if (req.body.image) {
+      try {
+        console.log('[OCR PHOTO] ⚠️ Tentative de fallback déterministe...');
+        // Note: On n'a pas le texte OCR ici, donc on retourne une erreur
+        res.status(500).json({
+          success: false,
+          error: 'OCR_FAILED',
+          message: 'Erreur lors de l\'OCR ou de la structuration',
+          details: error.message
+        });
+      } catch (fallbackError) {
+        res.status(500).json({
+          success: false,
+          error: 'OCR_FAILED',
+          message: 'Erreur lors de l\'OCR ou de la structuration',
+          details: error.message
+        });
+      }
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'OCR_FAILED',
+        message: 'Erreur lors de l\'OCR ou de la structuration',
+        details: error.message
+      });
+    }
+  }
+});
+
+// Route POST /api/ordonnance/photo - Proxy vers n8n OCR (pas de logique OCR locale)
+app.post('/api/ordonnance/photo', async (req, res) => {
+  console.log('[ORD PHOTO] POST /api/ordonnance/photo appelée');
+
+  try {
+    const { image } = req.body;
+
+    // Validation
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_IMAGE',
+        message: 'Le champ image (base64) est requis'
+      });
+    }
+
+    // Extraire le base64 pur (sans le préfixe data:image/...;base64,)
+    let base64Data = image;
+    if (base64Data.includes(',')) {
+      base64Data = base64Data.split(',')[1];
+    }
+
+    // Détecter le type MIME depuis le préfixe si présent
+    let mimeType = 'image/jpeg';
+    if (image.startsWith('data:')) {
+      const mimeMatch = image.match(/data:([^;]+)/);
+      if (mimeMatch) {
+        mimeType = mimeMatch[1];
+      }
+    }
+
+    // Convertir le base64 en buffer
+    const imageBuffer = Buffer.from(base64Data, 'base64');
+
+    // Créer un FormData pour envoyer l'image à n8n
+    const formData = new FormData();
+    const blob = new Blob([imageBuffer], { type: mimeType });
+    formData.append('file', blob, 'image.jpg');
+
+    // Envoyer l'image au webhook n8n OCR
+    console.log('[ORD PHOTO] Envoi vers n8n OCR');
+    const n8nResponse = await fetch(N8N_OCR_WEBHOOK_URL, {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!n8nResponse.ok) {
+      const errorText = await n8nResponse.text();
+      console.error('[ORD PHOTO] ❌ Erreur n8n:', n8nResponse.status, errorText);
+      return res.status(n8nResponse.status || 500).json({
+        success: false,
+        error: 'N8N_OCR_ERROR',
+        message: 'Erreur lors du traitement OCR par n8n',
+        details: errorText
+      });
+    }
+
+    // Récupérer la réponse brute de n8n (texte ou JSON)
+    const rawText = await n8nResponse.text();
+    console.log('[ORD PHOTO] Réponse brute n8n reçue');
+
+    // Traiter la réponse OCR comme une STRING BRUTE sans parsing ni nettoyage
+    // Ne pas parser, splitter, nettoyer ou modifier le texte OCR
+    let ocrText = '';
+    
+    // Si rawText existe, l'utiliser directement comme string brute
+    if (rawText) {
+      // Tenter d'extraire depuis JSON si c'est du JSON, sinon utiliser rawText tel quel
+      try {
+        const parsed = JSON.parse(rawText);
+        // Extraire le texte depuis les champs possibles, mais conserver l'intégralité
+        const extracted = parsed.text || parsed.ocr || parsed.result;
+        // Si un champ est trouvé, l'utiliser tel quel (string brute)
+        ocrText = extracted ? extracted.toString() : rawText.toString();
+      } catch {
+        // Si ce n'est pas du JSON, utiliser rawText tel quel comme string brute
+        ocrText = rawText.toString();
+      }
+    }
+
+    // Validation SAFE : vérifier la longueur sans modifier le texte
+    if (ocrText && ocrText.length > 0) {
+      console.log('[ORD PHOTO] OCR length:', ocrText.length);
+      console.log('[ORD PHOTO] Début OCR:', ocrText.slice(0, 200));
+      console.log('[ORD PHOTO] Fin OCR:', ocrText.slice(-200));
+    } else {
+      console.log('[ORD PHOTO] n8n n\'a renvoyé aucun texte OCR');
+      console.log('⚠️  [ORD PHOTO] OCR vide – aucune structuration possible');
+      // Si OCR vide, retourner une structure vide
+      return res.json({
+        success: true,
+        ordonnance: {
+          medecin: {
+            nom: '',
+            specialite: '',
+            contact: ''
+          },
+          patient: {
+            nom: '',
+            prenom: '',
+            securite_sociale: ''
+          },
+          contenu: {
+            lignes: []
+          },
+          medicaments: [],
+          texte_brut: ''
+        }
+      });
+    }
+
+    // Étape de pré-structuration avec LLM (sans classification automatique)
+    let structuredOrdonnance = null;
+    // Récupérer la clé UNIQUEMENT via app.locals (source de vérité)
+    const OPENAI_API_KEY = req.app.locals.OPENAI_API_KEY;
+    
+    // Log de diagnostic
+    if (!OPENAI_API_KEY) {
+      console.error('[ORD PHOTO] ❌ OPENAI_API_KEY absente (app.locals)');
+      console.error('[ORD PHOTO] ❌ La pré-structuration IA ne sera pas exécutée');
+    } else {
+      console.log('[ORD PHOTO] ✅ OPENAI_API_KEY trouvée (app.locals, length:', OPENAI_API_KEY.length, ')');
+    }
+    
+    if (OPENAI_API_KEY && ocrText.trim().length > 0) {
+      console.log('[ORD PHOTO] Appel LLM pour pré-structuration...');
+      try {
+        const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o',
+            temperature: 0.1,
+            messages: [
+              {
+                role: 'system',
+                content: `Tu es un assistant médical.
+
+À partir du texte OCR suivant, structure une ordonnance médicale française
+en champs simples, sans jamais décider du type d'ordonnance.
+
+RÈGLES STRICTES :
+- Ne jamais inventer d'information
+- Laisser les champs vides si absents
+- Toujours retourner un JSON valide
+- Ne jamais expliquer
+- Ne jamais utiliser de Markdown
+- Ne jamais classer l'ordonnance
+
+FORMAT OBLIGATOIRE :
+
+{
+  "medecin": {
+    "nom": "",
+    "specialite": "",
+    "contact": ""
+  },
+  "patient": {
+    "nom": "",
+    "prenom": "",
+    "securite_sociale": ""
+  },
+  "contenu": {
+    "lignes": []
+  },
+  "medicaments": [
+    {
+      "nom": "",
+      "posologie": "",
+      "duree": ""
+    }
+  ],
+  "texte_brut": ""
+}`
+              },
+              {
+                role: 'user',
+                content: `Texte OCR :
+${ocrText}`
+              }
+            ],
+            response_format: { type: 'json_object' }
+          })
+        });
+
+        if (aiRes.ok) {
+          const aiData = await aiRes.json();
+          try {
+            const content = aiData.choices[0].message.content;
+            structuredOrdonnance = typeof content === 'string' ? JSON.parse(content) : content;
+            // S'assurer que texte_brut contient ocrText
+            structuredOrdonnance.texte_brut = ocrText;
+            console.log('[ORD PHOTO] Pré-structuration LLM réussie');
+            console.log('[ORD PHOTO] Pré-structuration IA exécutée');
+          } catch (parseError) {
+            console.error('[ORD PHOTO] ❌ Erreur parsing JSON LLM:', parseError.message);
+          }
+        } else {
+          const errorText = await aiRes.text();
+          console.error('[ORD PHOTO] ❌ Erreur LLM:', aiRes.status, errorText);
+        }
+      } catch (llmError) {
+        console.error('[ORD PHOTO] ❌ Erreur lors de l\'appel LLM:', llmError.message);
+      }
+    } else {
+      if (!OPENAI_API_KEY) {
+        console.error('[ORD PHOTO] ❌ OPENAI_API_KEY absente (app.locals) - pré-structuration ignorée');
+        console.error('[ORD PHOTO] ❌ Vérifiez que la clé est bien définie dans le fichier .env');
+      } else if (ocrText.trim().length === 0) {
+        console.warn('[ORD PHOTO] ⚠️ Texte OCR vide - pré-structuration ignorée');
+      }
+    }
+
+    // Si la pré-structuration a échoué ou n'est pas disponible, créer une structure basique
+    if (!structuredOrdonnance) {
+      console.log('[ORD PHOTO] Utilisation d\'une structure basique (fallback)');
+      structuredOrdonnance = {
+        medecin: {
+          nom: '',
+          specialite: '',
+          contact: ''
+        },
+        patient: {
+          nom: '',
+          prenom: '',
+          securite_sociale: ''
+        },
+        contenu: {
+          lignes: ocrText.split('\n').filter(line => line.trim().length > 0)
+        },
+        medicaments: [],
+        texte_brut: ocrText
+      };
+    }
+
+    // Retourner le JSON structuré au frontend
+    console.log('[ORD PHOTO] JSON structuré renvoyé au frontend');
+    return res.json({
+      success: true,
+      ordonnance: structuredOrdonnance
+    });
+
+  } catch (error) {
+    console.error('[ORD PHOTO] ❌ Erreur:', error.message);
+    console.error('[ORD PHOTO] Stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: 'OCR_FAILED',
+      message: 'Erreur lors de l\'envoi vers n8n OCR',
+      details: error.message
+    });
+  }
+});
+
+// Route POST /api/ordonnance/finalize - Finaliser l'enregistrement d'une ordonnance selon le type
+app.post('/api/ordonnance/finalize', (req, res) => {
+  console.log('[FINALIZE] POST /api/ordonnance/finalize appelée');
+
+  try {
+    const { structured, type } = req.body;
+
+    // Validation
+    if (!structured || typeof structured !== 'object') {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_STRUCTURED',
+        message: 'Le champ structured (JSON structuré) est requis'
+      });
+    }
+
+    if (!type || !['MEDICAMENT', 'RENDEZ_VOUS'].includes(type)) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_TYPE',
+        message: 'Le champ type doit être "MEDICAMENT" ou "RENDEZ_VOUS"'
+      });
+    }
+
+    // Extraire les données structurées
+    const medecin = structured.medecin || '';
+    const patient = structured.patient || '';
+    const medicaments = structured.medicaments || [];
+    const texteBrut = structured.texte_brut || '';
+
+    // Transformer les médicaments au format attendu par createOrdonnance
+    const medications = medicaments.map(med => ({
+      name: med.nom || '',
+      dosage: med.dosage || '',
+      frequency: med.posologie || '',
+      duration: med.duree || null
+    }));
+
+    // Préparer les données de l'ordonnance
+    const ordonnanceData = {
+      source: 'ocr_manuscrit',
+      rawText: texteBrut,
+      doctorName: medecin || null,
+      patientName: patient || null,
+      medications: medications,
+      status: type === 'RENDEZ_VOUS' ? 'rdv_a_planifier' : 'a_recuperer',
+      createdAt: new Date().toISOString(),
+      type: type // Ajouter le type à l'ordonnance
+    };
+
+    // Créer l'ordonnance
+    const ordonnance = createOrdonnance(ordonnanceData);
+
+    // Gérer les actions spécifiques selon le type
+    if (type === 'MEDICAMENT') {
+      console.log('[FINALIZE] Type MEDICAMENT - Préparation workflow notifications/calendrier');
+      // TODO: Préparer le workflow notifications / calendrier
+      // Exemple : appeler un webhook n8n pour les notifications
+      // Exemple : créer des événements calendrier pour les prises de médicaments
+    } else if (type === 'RENDEZ_VOUS') {
+      console.log('[FINALIZE] Type RENDEZ_VOUS - Préparation orientation Doctolib');
+      // Marquer l'ordonnance comme RDV
+      ordonnance.isRdv = true;
+      // TODO: Préparer l'orientation Doctolib
+      // Exemple : générer un lien Doctolib ou appeler une API Doctolib
+    }
+
+    console.log('[FINALIZE] Ordonnance finalisée avec succès');
+    console.log('[FINALIZE] ID:', ordonnance.id);
+    console.log('[FINALIZE] Type:', type);
+    console.log('[FINALIZE] Status:', ordonnance.status);
+
+    // Retourner l'ordonnance créée
+    res.status(201).json({
+      success: true,
+      ordonnance: ordonnance,
+      type: type
+    });
+
+  } catch (error) {
+    console.error('[FINALIZE] ❌ Erreur lors de la finalisation:', error.message);
+    console.error('[FINALIZE] Stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: 'FINALIZATION_ERROR',
+      message: 'Erreur lors de la finalisation de l\'ordonnance',
+      details: error.message
+    });
+  }
+});
+
+// Route POST /api/ordonnance/analyze - Analyser un texte brut d'ordonnance
+app.post('/api/ordonnance/analyze', (req, res) => {
+  console.log('[ANALYZE] POST /api/ordonnance/analyze appelée');
+
+  try {
+    const { rawText } = req.body;
+
+    // Validation
+    if (!rawText || typeof rawText !== 'string' || rawText.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_RAWTEXT',
+        message: 'Le champ rawText est requis et ne peut pas être vide'
+      });
+    }
+
+    // Analyser le texte brut
+    const analyzedData = analyzeOrdonnanceText(rawText);
+
+    console.log('[ANALYZE] Analyse terminée');
+    console.log('[ANALYZE] Score de confiance:', analyzedData.confidenceScore);
+    console.log('[ANALYZE] Médecin:', analyzedData.doctor.name);
+    console.log('[ANALYZE] Patient:', analyzedData.patient.name);
+    console.log('[ANALYZE] Prescriptions:', analyzedData.prescription.length);
+
+    // Retourner le JSON strict
+    res.status(200).json(analyzedData);
+
+  } catch (error) {
+    console.error('[ANALYZE] ❌ Erreur lors de l\'analyse:', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'ANALYSIS_ERROR',
+      message: 'Erreur lors de l\'analyse de l\'ordonnance',
+      details: error.message
+    });
+  }
+});
+
+app.get('/api/ordonnances', (req, res) => {
+  console.log('[ORD LIST] GET /api/ordonnances - Récupération de toutes les ordonnances');
+  console.log('[ORD LIST] Nombre d\'ordonnances retournées :', ordonnances.length);
+  
+  // Retourner toutes les ordonnances sans filtre par source
+  res.status(200).json({
+    success: true,
+    ordonnances: ordonnances,
+    count: ordonnances.length
+  });
+});
+
+// Handler 404 pour les routes non trouvées (diagnostic)
+app.use((req, res) => {
+  console.error('❌ ===== ROUTE NON TROUVÉE (404) =====');
+  console.error('📥 Méthode:', req.method);
+  console.error('🔗 Path:', req.path);
+  console.error('🔗 URL complète:', req.url);
+  console.error('📋 Headers:', {
+    'content-type': req.headers['content-type'],
+    'user-agent': req.headers['user-agent']
+  });
+  
+  res.status(404).json({
+    error: 'ROUTE_NOT_FOUND',
+    message: `Route ${req.method} ${req.path} non trouvée`,
+    availableRoutes: [
+      'GET /',
+      'GET /health',
+      'GET /ping',
+      'POST /extract',
+      'POST /analyze-ordonnance',
+      'POST /analyze-ordonnance-test',
+      'GET /test-n8n',
+      'POST /api/ocr/handwritten',
+      'POST /api/ordonnances/create',
+      'POST /api/ordonnance/ocr',
+      'POST /api/ordonnance/analyze',
+      'POST /api/ordonnance/photo',
+      'POST /api/ordonnance/finalize',
+      'POST /ocr-photo',
+      'GET /api/ordonnances'
+    ]
+  });
+});
+
+// Démarrage du serveur
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`✅ Serveur démarré sur http://localhost:${PORT}`);
+  console.log(`✅ Accessible depuis le réseau: http://192.168.1.68:${PORT}`);
+  console.log('📋 Routes disponibles:');
+  console.log('   - GET  /');
+  console.log('   - GET  /health');
+  console.log('   - GET  /ping');
+  console.log('   - POST /extract');
+  console.log('   - POST /analyze-ordonnance');
+  console.log('   - POST /analyze-ordonnance-test');
+  console.log('   - GET  /test-n8n');
+  console.log('   - POST /api/ocr/handwritten');
+  console.log('   - POST /api/ordonnances/create');
+  console.log('   - POST /api/ordonnance/ocr');
+  console.log('   - POST /api/ordonnance/analyze');
+      console.log('   - POST /api/ordonnance/photo');
+      console.log('   - POST /api/ordonnance/finalize');
+      console.log('   - POST /ocr-photo');
+      console.log('   - GET  /api/ordonnances');
+});
