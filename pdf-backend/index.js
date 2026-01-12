@@ -4,6 +4,9 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+console.log("🚀 Backend started");
+console.log("NODE_ENV:", process.env.NODE_ENV);
+
 // Logs temporaires de diagnostic
 console.log("🔥 STARTUP FILE:", import.meta.url);
 console.log("🔥 ENV OPENAI_API_KEY LOADED:", !!process.env.OPENAI_API_KEY);
@@ -48,6 +51,10 @@ const PORT = process.env.PORT || 3000;
 app.locals.OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 console.log('ENV CHECK → OPENAI (locals):', !!app.locals.OPENAI_API_KEY);
 
+// Log SAFE pour confirmer la présence de la clé OpenAI sans l'afficher
+const k = process.env.OPENAI_API_KEY;
+console.log("[ENV] OPENAI_API_KEY present =", !!k, "len =", k ? k.length : 0, "prefix =", k ? k.slice(0, 10) : null);
+
 // ===== CONFIGURATION DES BODY PARSERS AU TOUT DÉBUT =====
 // CRITIQUE: Ces middlewares DOIVENT être placés AVANT tout autre middleware
 // IMPORTANT: body-parser (ou sa configuration par défaut) causait PayloadTooLargeError (HTTP 413) avec les photos base64
@@ -56,6 +63,40 @@ console.log('ENV CHECK → OPENAI (locals):', !!app.locals.OPENAI_API_KEY);
 // Aucun body-parser ne doit être utilisé dans le projet (ni import, ni app.use)
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
+
+// ===== MIDDLEWARE DE LOGGING GLOBAL =====
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const method = req.method;
+  const path = req.path;
+  const contentType = req.headers['content-type'] || 'N/A';
+  const userAgent = req.headers['user-agent'] || 'N/A';
+  const ip = req.ip || req.connection.remoteAddress || 'N/A';
+
+  // Intercepter la fin de la réponse pour logger le statusCode et la durée
+  const originalSend = res.send;
+  const originalJson = res.json;
+  
+  res.send = function(body) {
+    const duration = Date.now() - startTime;
+    const statusCode = res.statusCode;
+    
+    console.log(`[${method}] ${path} - ${statusCode} - ${duration}ms - ${contentType} - ${userAgent} - ${ip}`);
+    
+    return originalSend.call(this, body);
+  };
+  
+  res.json = function(body) {
+    const duration = Date.now() - startTime;
+    const statusCode = res.statusCode;
+    
+    console.log(`[${method}] ${path} - ${statusCode} - ${duration}ms - ${contentType} - ${userAgent} - ${ip}`);
+    
+    return originalJson.call(this, body);
+  };
+
+  next();
+});
 
 // URL du webhook n8n pour la structuration d'ordonnances
 const N8N_WEBHOOK_URL = 'https://jordanconsultia.app.n8n.cloud/webhook/pdf-ordonnance';
@@ -128,6 +169,12 @@ const upload = multer({
   limits: {
     fileSize: 10 * 1024 * 1024 // Limite de 10MB
   }
+});
+
+// Configuration multer pour POST /ocr-photo - Accepte plusieurs fieldnames
+const uploadImage = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 3 * 1024 * 1024 }
 });
 
 // Fonction pour structurer le texte en sections médicales explicites
@@ -274,6 +321,11 @@ app.get('/', (req, res) => {
   res.send('BACKEND OK');
 });
 
+// Routes silencieuses pour éviter les 404 parasites
+app.get('/favicon.ico', (req, res) => {
+  res.status(204).end();
+});
+
 // Route GET /ping
 app.get('/ping', (req, res) => {
   console.log('PING OK');
@@ -282,7 +334,24 @@ app.get('/ping', (req, res) => {
 
 // Route GET /health - Health check endpoint
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+  res.status(200).json({ 
+    status: 'ok',
+    timestamp: Date.now()
+  });
+});
+
+// Route GET /version - Version info endpoint
+app.get('/version', (req, res) => {
+  res.status(200).json({
+    name: 'pdf-backend',
+    time: Date.now(),
+    env: process.env.NODE_ENV || null
+  });
+});
+
+// Route GET /beacon - Beacon endpoint (silencieux pour éviter 404)
+app.get('/beacon', (req, res) => {
+  res.status(204).end();
 });
 
 // Route POST /extract
@@ -1582,28 +1651,54 @@ app.post('/api/ordonnance/ocr', async (req, res) => {
 // - MISTRAL_API_KEY: Clé API Mistral pour l'OCR
 // - OPENAI_API_KEY: Clé API OpenAI pour la structuration (optionnel, fallback déterministe si absent)
 //
-// Body attendu: { "image": "base64_string" }
+// Body attendu: { "image": "base64_string" } (JSON uniquement, pas multipart)
 // Retourne: JSON structuré selon le schéma Medicalia strict
 app.post('/ocr-photo', async (req, res) => {
+  const t0 = Date.now();
   console.log('[OCR PHOTO] POST /ocr-photo appelée');
-
+  
+  // Vérifier que OPENAI_API_KEY est présente et valide
+  if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.length < 20) {
+    console.log("[OCR_PHOTO] Missing/invalid OPENAI_API_KEY, len =", process.env.OPENAI_API_KEY?.length ?? 0);
+    return res.status(500).json({ error: "OPENAI_API_KEY_MISSING_OR_INVALID" });
+  }
+  
   try {
-    const { image } = req.body;
-
-    // Validation
-    if (!image || typeof image !== 'string') {
+    // Validation: vérifier que le body contient STRICTEMENT { base64: string }
+    const bodyKeys = Object.keys(req.body || {});
+    
+    // Refuser toute autre clé que base64
+    if (bodyKeys.length !== 1 || !bodyKeys.includes('base64')) {
       return res.status(400).json({
-        success: false,
-        error: 'INVALID_IMAGE',
-        message: 'Le champ image (base64) est requis'
+        error: 'INVALID_BASE64',
+        message: 'Le body doit contenir uniquement { base64: string }'
       });
     }
 
+    const { base64 } = req.body;
+
+    // Vérifier typeof base64 === "string" et base64.length > 100
+    if (typeof base64 !== 'string' || base64.length <= 100) {
+      return res.status(400).json({
+        error: 'INVALID_BASE64',
+        message: 'Le champ base64 doit être une string de plus de 100 caractères'
+      });
+    }
+
+    // Logs
+    console.log("[OCR] base64 length =", base64.length);
+    console.log("[OCR] request OK");
+
+    console.log("[OCR-PHOTO] checkpoint A: base64 ok");
+
     // 1️⃣ OCR Mistral
     console.log('[OCR PHOTO] Appel OCR Mistral...');
+    console.log("[OCR-PHOTO] checkpoint B: avant appel Mistral");
     const mistralApiKey = process.env.MISTRAL_API_KEY;
     if (!mistralApiKey) {
       console.error('[OCR PHOTO] ❌ MISTRAL_API_KEY non définie');
+      const totalDuration = Date.now() - t0;
+      console.log(`[OCR-PHOTO] checkpoint D: erreur MISSING_API_KEY - temps total: ${totalDuration}ms`);
       return res.status(500).json({
         success: false,
         error: 'MISSING_API_KEY',
@@ -1611,37 +1706,79 @@ app.post('/ocr-photo', async (req, res) => {
       });
     }
 
-    // Préparer l'image base64 avec le préfixe data URL si nécessaire
-    let imageDataUrl = image;
-    if (!imageDataUrl.startsWith('data:')) {
-      imageDataUrl = `data:image/jpeg;base64,${image}`;
+    // Supporter data URI: "data:image/jpeg;base64,...." -> strip le préfixe si présent
+    let base64Data = base64;
+    let mimeType = 'image/jpeg';
+    
+    if (base64.startsWith('data:')) {
+      const mimeMatch = base64.match(/data:([^;]+)/);
+      if (mimeMatch) {
+        mimeType = mimeMatch[1];
+      }
+      // Strip le préfixe data URI
+      if (base64.includes(',')) {
+        base64Data = base64.split(',')[1];
+      }
     }
+    
+    const imageDataUrl = `data:${mimeType};base64,${base64Data}`;
 
-    // Appel à l'API Mistral Vision officielle
-    const ocrRes = await fetch('https://api.mistral.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${mistralApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'mistral-large-latest',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut sans commentaire.' },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: imageDataUrl
+    // Créer un AbortController pour gérer le timeout
+    const abortController = new AbortController();
+    const timeoutMs = 60000; // 60 secondes
+    const timeoutId = setTimeout(() => {
+      abortController.abort();
+    }, timeoutMs);
+
+    let ocrRes;
+    try {
+      // Appel à l'API Mistral Vision officielle
+      ocrRes = await fetch('https://api.mistral.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${mistralApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'mistral-large-latest',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut sans commentaire.' },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: imageDataUrl
+                  }
                 }
-              }
-            ]
-          }
-        ]
-      })
-    });
+              ]
+            }
+          ]
+        }),
+        signal: abortController.signal
+      });
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      if (fetchError.name === 'AbortError') {
+        console.error('[OCR PHOTO] ❌ Timeout Mistral après', timeoutMs, 'ms');
+        const totalDuration = Date.now() - t0;
+        console.log(`[OCR-PHOTO] checkpoint D: erreur MISTRAL_TIMEOUT - temps total: ${totalDuration}ms`);
+        return res.status(504).json({
+          success: false,
+          error: 'MISTRAL_TIMEOUT',
+          message: 'OCR Mistral trop long'
+        });
+      }
+      // Autre erreur de fetch
+      throw fetchError;
+    }
+    
+    clearTimeout(timeoutId);
+
+    const t1 = Date.now();
+    const mistralDuration = t1 - t0;
+    console.log(`[OCR-PHOTO] checkpoint C: réponse Mistral reçue - status: ${ocrRes.status}, temps écoulé: ${mistralDuration}ms`);
 
     if (!ocrRes.ok) {
       const errorText = await ocrRes.text();
@@ -1655,6 +1792,8 @@ app.post('/ocr-photo', async (req, res) => {
 
     if (!text || text.trim().length === 0) {
       console.warn('[OCR PHOTO] ⚠️ Texte OCR vide');
+      const totalDuration = Date.now() - t0;
+      console.log(`[OCR-PHOTO] checkpoint D: erreur EMPTY_OCR_TEXT - temps total: ${totalDuration}ms`);
       return res.status(400).json({
         success: false,
         error: 'EMPTY_OCR_TEXT',
@@ -1674,6 +1813,8 @@ app.post('/ocr-photo', async (req, res) => {
       console.log('[OCR PHOTO] ⚠️ Utilisation de la fonction déterministe (fallback)');
       const structured = analyzeOrdonnanceText(text);
       const normalized = normalizeOrdonnance(structured, text);
+      const totalDuration = Date.now() - t0;
+      console.log(`[OCR-PHOTO] checkpoint D: succès (fallback déterministe) - temps total: ${totalDuration}ms`);
       return res.status(200).json(normalized);
     }
 
@@ -1740,6 +1881,8 @@ Règles strictes:
       console.log('[OCR PHOTO] ⚠️ Utilisation de la fonction déterministe (fallback)');
       const structured = analyzeOrdonnanceText(text);
       const normalized = normalizeOrdonnance(structured, text);
+      const totalDuration = Date.now() - t0;
+      console.log(`[OCR-PHOTO] checkpoint D: succès (fallback déterministe) - temps total: ${totalDuration}ms`);
       return res.status(200).json(normalized);
     }
 
@@ -1772,39 +1915,44 @@ Règles strictes:
     console.log('[OCR PHOTO] Patient:', normalized.patient.name);
     console.log('[OCR PHOTO] Prescriptions:', normalized.prescription.length);
 
-    res.status(200).json(normalized);
+    const totalDuration = Date.now() - t0;
+    console.log(`[OCR-PHOTO] checkpoint D: succès - temps total: ${totalDuration}ms`);
+    return res.status(200).json(normalized);
 
-  } catch (error) {
-    console.error('[OCR PHOTO] ❌ Erreur:', error.message);
-    console.error('[OCR PHOTO] Stack:', error.stack);
+  } catch (e) {
+    console.error("[OCR] ERROR", e.message || e);
+    if (e.stack) {
+      console.error("[OCR] Stack:", e.stack);
+    }
+    const totalDuration = Date.now() - t0;
+    console.log(`[OCR-PHOTO] checkpoint D: erreur dans catch - temps total: ${totalDuration}ms`);
+    return res.status(500).json({ 
+      error: "OCR_FAILED"
+    });
+  }
+});
+
+// Route POST /debug/base64-check - Vérifier que la base64 arrive correctement
+app.post('/debug/base64-check', (req, res) => {
+  try {
+    const { base64 } = req.body;
     
-    // En cas d'erreur, essayer le fallback déterministe si on a le texte
-    if (req.body.image) {
-      try {
-        console.log('[OCR PHOTO] ⚠️ Tentative de fallback déterministe...');
-        // Note: On n'a pas le texte OCR ici, donc on retourne une erreur
-        res.status(500).json({
-          success: false,
-          error: 'OCR_FAILED',
-          message: 'Erreur lors de l\'OCR ou de la structuration',
-          details: error.message
-        });
-      } catch (fallbackError) {
-        res.status(500).json({
-          success: false,
-          error: 'OCR_FAILED',
-          message: 'Erreur lors de l\'OCR ou de la structuration',
-          details: error.message
-        });
-      }
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'OCR_FAILED',
-        message: 'Erreur lors de l\'OCR ou de la structuration',
-        details: error.message
+    if (!base64 || typeof base64 !== 'string') {
+      return res.status(400).json({
+        error: 'INVALID_BASE64',
+        message: 'Le champ base64 (string) est requis'
       });
     }
+
+    return res.status(200).json({
+      length: base64.length,
+      prefix: base64.substring(0, 30)
+    });
+  } catch (e) {
+    console.error("[DEBUG] ERROR", e.message || e);
+    return res.status(500).json({
+      error: "DEBUG_FAILED"
+    });
   }
 });
 
@@ -2068,24 +2216,77 @@ ${ocrText}`
 // Route POST /api/ordonnance/finalize - Finaliser l'enregistrement d'une ordonnance selon le type
 app.post('/api/ordonnance/finalize', (req, res) => {
   console.log('[FINALIZE] POST /api/ordonnance/finalize appelée');
+  
+  console.log("[FINALIZE] body keys", Object.keys(req.body || {}));
+  console.log("[FINALIZE] has structured", !!req.body?.structured);
+  console.log("[FINALIZE] has output", !!req.body?.output);
 
   try {
-    const { structured, type } = req.body;
+    const { structured: inputStructured, output, type } = req.body;
+
+    // Accepter plusieurs formats d'input
+    let structured = inputStructured || output || req.body;
+
+    // Détecter si c'est le format A (doctor, patient, prescription)
+    const isFormatA = structured && 
+                      typeof structured === 'object' &&
+                      (structured.doctor || structured.patient || structured.prescription);
+
+    if (isFormatA) {
+      console.log('[FINALIZE] Format A détecté - Conversion vers schéma Medicalia');
+      
+      // Convertir du format A vers le schéma Medicalia attendu
+      const doctorObj = structured.doctor || {};
+      const patientObj = structured.patient || {};
+      const prescriptionArray = Array.isArray(structured.prescription) ? structured.prescription : [];
+      
+      // Extraire le nom du médecin (peut être une string ou un objet avec name)
+      const doctorName = typeof doctorObj === 'string' 
+        ? doctorObj 
+        : (doctorObj.name || '');
+      
+      // Extraire le nom du patient (peut être une string ou un objet avec name)
+      const patientName = typeof patientObj === 'string'
+        ? patientObj
+        : (patientObj.name || '');
+      
+      // Convertir les prescriptions en médicaments
+      const medicaments = prescriptionArray.map(pres => ({
+        nom: pres.medicament || pres.name || pres.nom || '',
+        dosage: pres.dosage || '',
+        posologie: pres.posologie || pres.frequency || pres.frequence || '',
+        duree: pres.duration || pres.duree || null
+      }));
+      
+      // Construire le schéma Medicalia
+      structured = {
+        medecin: doctorName,
+        patient: patientName,
+        medicaments: medicaments,
+        texte_brut: structured.rawText || structured.text || ''
+      };
+      
+      console.log('[FINALIZE] Conversion terminée:', {
+        medecin: structured.medecin,
+        patient: structured.patient,
+        medicamentsCount: structured.medicaments.length
+      });
+    }
 
     // Validation
     if (!structured || typeof structured !== 'object') {
       return res.status(400).json({
-        success: false,
         error: 'INVALID_STRUCTURED',
-        message: 'Le champ structured (JSON structuré) est requis'
+        expected: 'Un objet JSON structuré avec les champs suivants: { structured: { medecin, patient, medicaments, texte_brut } } OU { output: { doctor, patient, prescription, rawText } } OU directement un objet avec { doctor, patient, prescription } (format A)',
+        receivedKeys: Object.keys(req.body || {})
       });
     }
 
     if (!type || !['MEDICAMENT', 'RENDEZ_VOUS'].includes(type)) {
       return res.status(400).json({
-        success: false,
         error: 'INVALID_TYPE',
-        message: 'Le champ type doit être "MEDICAMENT" ou "RENDEZ_VOUS"'
+        receivedType: req.body?.type ?? null,
+        allowedTypes: ['MEDICAMENT', 'RENDEZ_VOUS']
       });
     }
 
@@ -2181,8 +2382,8 @@ app.post('/api/ordonnance/analyze', (req, res) => {
     console.log('[ANALYZE] Patient:', analyzedData.patient.name);
     console.log('[ANALYZE] Prescriptions:', analyzedData.prescription.length);
 
-    // Retourner le JSON strict
-    res.status(200).json(analyzedData);
+    // Retourner le JSON strict enveloppé dans { output: ... }
+    return res.json({ output: analyzedData });
 
   } catch (error) {
     console.error('[ANALYZE] ❌ Erreur lors de l\'analyse:', error.message);
@@ -2225,6 +2426,8 @@ app.use((req, res) => {
       'GET /',
       'GET /health',
       'GET /ping',
+      'GET /version',
+      'GET /beacon',
       'POST /extract',
       'POST /analyze-ordonnance',
       'POST /analyze-ordonnance-test',
@@ -2250,6 +2453,8 @@ app.listen(PORT, () => {
   console.log('   - GET  /');
   console.log('   - GET  /health');
   console.log('   - GET  /ping');
+  console.log('   - GET  /version');
+  console.log('   - GET  /beacon');
   console.log('   - POST /extract');
   console.log('   - POST /analyze-ordonnance');
   console.log('   - POST /analyze-ordonnance-test');
