@@ -41,7 +41,7 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
-import { randomUUID, createHmac } from 'crypto';
+import { randomUUID, createHmac, createHash } from 'crypto';
 import OpenAI from 'openai';
 
 const app = express();
@@ -3374,6 +3374,52 @@ function generateFallbackSummary(personal, ordonnances) {
 }
 
 // ===== QR CODE API (Token signé pour ordonnances) =====
+// Fonction générique pour créer un token signé
+function createSignedToken(payload, secret) {
+  // Encoder le payload en base64url
+  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  
+  // Générer la signature HMAC
+  const hmac = createHmac('sha256', secret);
+  hmac.update(payloadBase64);
+  const signature = hmac.digest('base64url');
+  
+  // Token = payload.signature
+  return `${payloadBase64}.${signature}`;
+}
+
+// Fonction générique pour vérifier un token signé
+function verifySignedToken(token, secret) {
+  try {
+    // Séparer payload et signature
+    const [payloadBase64, signature] = token.split('.');
+    if (!payloadBase64 || !signature) {
+      return { valid: false, error: 'INVALID_TOKEN_FORMAT' };
+    }
+    
+    // Vérifier la signature
+    const hmac = createHmac('sha256', secret);
+    hmac.update(payloadBase64);
+    const expectedSignature = hmac.digest('base64url');
+    
+    if (signature !== expectedSignature) {
+      return { valid: false, error: 'INVALID_SIGNATURE' };
+    }
+    
+    // Décoder le payload
+    const payload = JSON.parse(Buffer.from(payloadBase64, 'base64url').toString('utf8'));
+    
+    // Vérifier l'expiration
+    if (payload.exp && Date.now() > payload.exp) {
+      return { valid: false, error: 'TOKEN_EXPIRED' };
+    }
+    
+    return { valid: true, payload };
+  } catch (error) {
+    return { valid: false, error: 'TOKEN_PARSE_ERROR' };
+  }
+}
+
 // Génère un token signé pour une ordonnance
 function generateQRToken(ordonnanceId) {
   const QR_SECRET = process.env.QR_SECRET || 'default-secret-change-in-production';
@@ -3386,52 +3432,21 @@ function generateQRToken(ordonnanceId) {
     exp: expiresAt
   };
   
-  // Encoder le payload en base64
-  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  
-  // Générer la signature HMAC
-  const hmac = createHmac('sha256', QR_SECRET);
-  hmac.update(payloadBase64);
-  const signature = hmac.digest('base64url');
-  
-  // Token = payload.signature
-  const token = `${payloadBase64}.${signature}`;
+  const token = createSignedToken(payload, QR_SECRET);
   
   return { token, expiresAt: new Date(expiresAt).toISOString() };
 }
 
 // Vérifie et résout un token QR
 function verifyQRToken(token) {
-  try {
-    const QR_SECRET = process.env.QR_SECRET || 'default-secret-change-in-production';
-    
-    // Séparer payload et signature
-    const [payloadBase64, signature] = token.split('.');
-    if (!payloadBase64 || !signature) {
-      return { valid: false, error: 'INVALID_TOKEN_FORMAT' };
-    }
-    
-    // Vérifier la signature
-    const hmac = createHmac('sha256', QR_SECRET);
-    hmac.update(payloadBase64);
-    const expectedSignature = hmac.digest('base64url');
-    
-    if (signature !== expectedSignature) {
-      return { valid: false, error: 'INVALID_SIGNATURE' };
-    }
-    
-    // Décoder le payload
-    const payload = JSON.parse(Buffer.from(payloadBase64, 'base64url').toString('utf8'));
-    
-    // Vérifier l'expiration
-    if (Date.now() > payload.exp) {
-      return { valid: false, error: 'TOKEN_EXPIRED' };
-    }
-    
-    return { valid: true, ordonnanceId: payload.id };
-  } catch (error) {
-    return { valid: false, error: 'TOKEN_PARSE_ERROR' };
+  const QR_SECRET = process.env.QR_SECRET || 'default-secret-change-in-production';
+  const result = verifySignedToken(token, QR_SECRET);
+  
+  if (!result.valid) {
+    return result;
   }
+  
+  return { valid: true, ordonnanceId: result.payload.id };
 }
 
 // Route GET /api/ordonnances/:id/qr - Générer un token QR pour une ordonnance
@@ -3461,6 +3476,7 @@ app.get('/api/ordonnances/:id/qr', (req, res) => {
       ok: true,
       ordonnanceId,
       qrPayload,
+      qrData: qrPayload, // Alias pour compatibilité frontend
       expiresAt
     });
     
@@ -3521,6 +3537,181 @@ app.get('/api/qr/resolve', (req, res) => {
       ok: false,
       error: 'QR_RESOLVE_FAILED',
       message: 'Erreur lors de la résolution du token QR'
+    });
+  }
+});
+
+// ===== PASSPORT SANTÉ QR API =====
+// Stockage temporaire des résumés médicaux (en mémoire, indexé par summaryHash)
+const passportSummariesStorage = new Map();
+
+// Fonction pour générer un hash simple d'un résumé
+function generateSummaryHash(personal, summary) {
+  const hash = createHash('sha256');
+  hash.update(JSON.stringify({ nom: personal.nom, prenom: personal.prenom, summary }));
+  return hash.digest('hex').substring(0, 16); // 16 premiers caractères
+}
+
+// Route GET /api/passport/qr - Générer un token QR pour le Passeport Santé
+app.get('/api/passport/qr', (req, res) => {
+  console.log('[PASSPORT_QR] GET /api/passport/qr appelée');
+  
+  try {
+    // Récupérer le secret (PASSPORT_QR_SECRET ou fallback QR_SECRET)
+    const PASSPORT_SECRET = process.env.PASSPORT_QR_SECRET || process.env.QR_SECRET;
+    
+    if (!PASSPORT_SECRET) {
+      console.error('[PASSPORT_QR] ❌ PASSPORT_QR_SECRET et QR_SECRET absents');
+      return res.status(500).json({
+        ok: false,
+        error: 'PASSPORT_SECRET_MISSING',
+        message: 'Secret de signature non configuré. Définissez PASSPORT_QR_SECRET ou QR_SECRET.'
+      });
+    }
+    
+    // MVP: accepter patientId ou body minimal (personal.nom + summaryHash)
+    const patientId = req.query.patientId || req.body?.patientId;
+    const personal = req.body?.personal;
+    const summaryHash = req.query.summaryHash || req.body?.summaryHash;
+    
+    // Générer un hash si on a personal + summary
+    let hash = summaryHash;
+    if (!hash && personal && req.body?.summary) {
+      hash = generateSummaryHash(personal, req.body.summary);
+      // Stocker le résumé pour résolution ultérieure
+      passportSummariesStorage.set(hash, {
+        summary: req.body.summary,
+        personal,
+        generatedAt: new Date().toISOString()
+      });
+    }
+    
+    const expiresIn = 30 * 24 * 60 * 60 * 1000; // 30 jours en millisecondes
+    const expiresAt = Date.now() + expiresIn;
+    
+    // Payload: type + patientId (optionnel) + summaryHash (optionnel) + exp
+    const payload = {
+      type: 'passport',
+      ...(patientId && { patientId }),
+      ...(hash && { summaryHash: hash }),
+      exp: expiresAt
+    };
+    
+    // Générer le token signé
+    const token = createSignedToken(payload, PASSPORT_SECRET);
+    
+    // Construire le deep link et l'URL web
+    const deepLink = `medicalia://passport?t=${token}`;
+    const webUrl = `https://medicalia.app/p/${token}`;
+    
+    console.log(`[PASSPORT_QR] issued exp=${new Date(expiresAt).toISOString()}`);
+    
+    return res.status(200).json({
+      ok: true,
+      qrPayload: deepLink, // Garder pour compatibilité
+      deepLink,
+      webUrl,
+      expiresAt: new Date(expiresAt).toISOString(),
+      serverBuild: 'AI_SUMMARY_V2'
+    });
+    
+  } catch (error) {
+    console.error('[PASSPORT_QR] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[PASSPORT_QR] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'PASSPORT_QR_GENERATION_FAILED',
+      message: 'Erreur lors de la génération du token QR Passeport'
+    });
+  }
+});
+
+// Route GET /api/passport/resolve - Résoudre un token QR Passeport Santé
+app.get('/api/passport/resolve', (req, res) => {
+  console.log('[PASSPORT_QR] GET /api/passport/resolve appelée');
+  
+  try {
+    const token = req.query.t;
+    
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'TOKEN_MISSING',
+        message: 'Le paramètre "t" (token) est requis'
+      });
+    }
+    
+    // Récupérer le secret
+    const PASSPORT_SECRET = process.env.PASSPORT_QR_SECRET || process.env.QR_SECRET;
+    
+    if (!PASSPORT_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error: 'PASSPORT_SECRET_MISSING',
+        message: 'Secret de signature non configuré'
+      });
+    }
+    
+    // Vérifier le token
+    const result = verifySignedToken(token, PASSPORT_SECRET);
+    
+    if (!result.valid) {
+      console.log(`[PASSPORT_QR] resolve fail: ${result.error}`);
+      return res.status(400).json({
+        ok: false,
+        error: result.error,
+        message: `Token invalide: ${result.error}`
+      });
+    }
+    
+    const payload = result.payload;
+    
+    // Vérifier que c'est un token passport
+    if (payload.type !== 'passport') {
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_TOKEN_TYPE',
+        message: 'Token non valide pour Passeport Santé'
+      });
+    }
+    
+    // MVP: Récupérer le résumé depuis le stockage ou générer un message
+    let summary = 'Résumé indisponible';
+    let source = 'generated';
+    let generatedAt = new Date().toISOString();
+    
+    if (payload.summaryHash) {
+      const stored = passportSummariesStorage.get(payload.summaryHash);
+      if (stored) {
+        summary = stored.summary;
+        source = 'cache';
+        generatedAt = stored.generatedAt;
+      }
+    }
+    
+    console.log(`[PASSPORT_QR] resolve ok: type=${payload.type}, source=${source}`);
+    
+    return res.status(200).json({
+      ok: true,
+      type: 'passport',
+      summary,
+      source,
+      generatedAt
+    });
+    
+  } catch (error) {
+    console.error('[PASSPORT_QR] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[PASSPORT_QR] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'PASSPORT_RESOLVE_FAILED',
+      message: 'Erreur lors de la résolution du token QR Passeport'
     });
   }
 });
@@ -3643,6 +3834,8 @@ app.use((req, res) => {
       'GET /api/ordonnances',
       'GET /api/ordonnances/:id/qr',
       'GET /api/qr/resolve',
+      'GET /api/passport/qr',
+      'GET /api/passport/resolve',
       'POST /api/deliveries/create'
   ];
   
