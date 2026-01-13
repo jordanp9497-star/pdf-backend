@@ -3467,8 +3467,15 @@ app.get('/api/ordonnances/:id/qr', (req, res) => {
     // Générer le token signé
     const { token, expiresAt } = generateQRToken(ordonnanceId);
     
-    // Construire le payload QR
-    const qrPayload = `medicalia://ordonnance/${ordonnanceId}?t=${token}`;
+    // Base URL web (depuis env ou fallback)
+    const PUBLIC_WEB_BASE_URL = process.env.PUBLIC_WEB_BASE_URL || 'https://medicalia.app';
+    
+    // Construire le deep link et l'URL web
+    const deepLink = `medicalia://ordonnance/${ordonnanceId}?t=${token}`;
+    const webUrl = `${PUBLIC_WEB_BASE_URL}/o/${token}`;
+    
+    // qrPayload pointe vers webUrl par défaut (scannable universellement)
+    const qrPayload = webUrl;
     
     console.log(`[QR] ✅ Token généré pour ordonnance: ${ordonnanceId}`);
     
@@ -3477,6 +3484,8 @@ app.get('/api/ordonnances/:id/qr', (req, res) => {
       ordonnanceId,
       qrPayload,
       qrData: qrPayload, // Alias pour compatibilité frontend
+      webUrl,
+      deepLink,
       expiresAt
     });
     
@@ -3541,6 +3550,154 @@ app.get('/api/qr/resolve', (req, res) => {
   }
 });
 
+// Route GET /o/:token - Page web pour QR code ordonnance
+app.get('/o/:token', (req, res) => {
+  console.log('[QR_WEB] GET /o/:token appelée');
+  
+  try {
+    const token = req.params.token;
+    
+    if (!token || typeof token !== 'string') {
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Erreur - Medicalia</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 40px 20px; }
+            h1 { color: #333; }
+            p { color: #666; }
+          </style>
+        </head>
+        <body>
+          <h1>Erreur</h1>
+          <p>Token invalide</p>
+        </body>
+        </html>
+      `);
+    }
+    
+    // Construire le deep link (on ne connaît pas l'ordonnanceId, donc on utilise juste le token)
+    const deepLink = `medicalia://ordonnance?t=${token}`;
+    
+    const html = `
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ordonnance Medicalia</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      border-radius: 20px;
+      padding: 40px;
+      max-width: 400px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      text-align: center;
+    }
+    h1 {
+      color: #333;
+      font-size: 28px;
+      margin-bottom: 10px;
+      font-weight: 600;
+    }
+    .subtitle {
+      color: #666;
+      font-size: 16px;
+      margin-bottom: 30px;
+    }
+    .app-button {
+      display: inline-block;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 16px 32px;
+      border-radius: 12px;
+      text-decoration: none;
+      font-size: 18px;
+      font-weight: 600;
+      margin: 20px 0;
+      transition: transform 0.2s, box-shadow 0.2s;
+      box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+    }
+    .app-button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+    }
+    .app-button:active {
+      transform: translateY(0);
+    }
+    .info-text {
+      color: #888;
+      font-size: 14px;
+      margin-top: 30px;
+      line-height: 1.6;
+    }
+    .logo {
+      font-size: 48px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">🏥</div>
+    <h1>Ordonnance Medicalia</h1>
+    <p class="subtitle">Accédez à votre ordonnance</p>
+    <a href="${deepLink}" class="app-button">Ouvrir dans l'app</a>
+    <p class="info-text">
+      Si vous n'avez pas l'app Medicalia, installez-la depuis l'App Store ou Google Play.
+    </p>
+  </div>
+  <script>
+    // Tentative d'ouverture automatique de l'app après 1 seconde
+    setTimeout(function() {
+      window.location.href = "${deepLink}";
+    }, 1000);
+  </script>
+</body>
+</html>
+    `;
+    
+    res.status(200).send(html);
+    
+  } catch (error) {
+    console.error('[QR_WEB] ❌ Erreur:', error.message);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html lang="fr">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Erreur - Medicalia</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 40px 20px; }
+          h1 { color: #333; }
+          p { color: #666; }
+        </style>
+      </head>
+      <body>
+        <h1>Erreur</h1>
+        <p>Une erreur est survenue lors du chargement de la page.</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
 // ===== PASSPORT SANTÉ QR API =====
 // Stockage temporaire des résumés médicaux (en mémoire, indexé par summaryHash)
 const passportSummariesStorage = new Map();
@@ -3560,12 +3717,17 @@ app.get('/api/passport/qr', (req, res) => {
     // Récupérer le secret (PASSPORT_QR_SECRET ou fallback QR_SECRET)
     const PASSPORT_SECRET = process.env.PASSPORT_QR_SECRET || process.env.QR_SECRET;
     
+    // Si secret absent, utiliser un mode unsigned (fallback)
     if (!PASSPORT_SECRET) {
-      console.error('[PASSPORT_QR] ❌ PASSPORT_QR_SECRET et QR_SECRET absents');
-      return res.status(500).json({
-        ok: false,
-        error: 'PASSPORT_SECRET_MISSING',
-        message: 'Secret de signature non configuré. Définissez PASSPORT_QR_SECRET ou QR_SECRET.'
+      console.warn('[PASSPORT_QR] secret missing -> fallback unsigned');
+      return res.status(200).json({
+        ok: true,
+        qrPayload: 'medicalia://passport?mode=unsigned',
+        deepLink: 'medicalia://passport?mode=unsigned',
+        webUrl: 'https://medicalia.app/p/unsigned',
+        expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
+        warning: 'PASSPORT_SECRET_MISSING',
+        serverBuild: 'PASSPORT_QR_FALLBACK'
       });
     }
     
@@ -3644,14 +3806,23 @@ app.get('/api/passport/resolve', (req, res) => {
       });
     }
     
+    // Vérifier si c'est un mode unsigned
+    if (token === 'unsigned' || token.includes('mode=unsigned')) {
+      return res.status(200).json({
+        ok: false,
+        error: 'UNSIGNED_QR',
+        message: 'QR non signé. Le secret de signature n\'est pas configuré.'
+      });
+    }
+    
     // Récupérer le secret
     const PASSPORT_SECRET = process.env.PASSPORT_QR_SECRET || process.env.QR_SECRET;
     
     if (!PASSPORT_SECRET) {
-      return res.status(500).json({
+      return res.status(200).json({
         ok: false,
         error: 'PASSPORT_SECRET_MISSING',
-        message: 'Secret de signature non configuré'
+        message: 'QR non signé. Le secret de signature n\'est pas configuré.'
       });
     }
     
@@ -3834,6 +4005,7 @@ app.use((req, res) => {
       'GET /api/ordonnances',
       'GET /api/ordonnances/:id/qr',
       'GET /api/qr/resolve',
+      'GET /o/:token',
       'GET /api/passport/qr',
       'GET /api/passport/resolve',
       'POST /api/deliveries/create'
