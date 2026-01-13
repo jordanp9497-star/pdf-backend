@@ -4,7 +4,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-console.log("✅ BOOT BUILD_SIGNATURE AI_SUMMARY_V2_2026-01-13_1535");
+console.log("✅ BOOT SIGNATURE __BUILD_CHECK");
 console.log("🚀 Backend started");
 console.log("NODE_ENV:", process.env.NODE_ENV);
 
@@ -42,6 +42,7 @@ import cors from 'cors';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import { randomUUID } from 'crypto';
+import OpenAI from 'openai';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -404,14 +405,15 @@ app.get('/ping', (req, res) => {
 
 // Route GET /__build - Build signature endpoint
 app.get("/__build", (req, res) => {
-  res.status(200).json({ ok: true, build: "AI_SUMMARY_V2_2026-01-13_1535" });
+  res.json({ ok: true, build: "__BUILD_CHECK" });
 });
 
 // Route GET /health - Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'ok',
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    serverBuild: 'AI_SUMMARY_V2_DEPLOY'
   });
 });
 
@@ -2726,7 +2728,7 @@ app.get('/api/ordonnances', (req, res) => {
   });
 });
 
-// ===== AI MEDICAL SUMMARY (factuel, mock pour l'instant) =====
+// ===== AI MEDICAL SUMMARY (synthèse factuelle) =====
 const validateAiSummaryBody = (body) => {
   if (!body || typeof body !== 'object') return 'BODY_MISSING';
   if (!body.personal || typeof body.personal !== 'object') return 'PERSONAL_MISSING';
@@ -2734,27 +2736,524 @@ const validateAiSummaryBody = (body) => {
   return null;
 };
 
-const aiSummaryHandler = (req, res) => {
-  console.log('[AI_SUMMARY] HIT', req.method, req.originalUrl);
-  const err = validateAiSummaryBody(req.body);
-  if (err) return res.status(400).json({ ok: false, error: 'INVALID_BODY', detail: err });
-
-  return res.status(200).json({
-    ok: true,
-    path: req.originalUrl,
-    received: {
-      personalKeys: Object.keys(req.body.personal || {}),
-      ordonnancesCount: req.body.ordonnances.length
+/**
+ * Construit un texte consolidé (facts only) à partir de personal + ordonnances
+ */
+function buildFactsText(personal, ordonnances) {
+  // Nettoyer les labels d'actions (limiter à 280 caractères et garder uniquement la partie après "ORDONNANCE" si présent)
+  const cleanActionLabel = (label) => {
+    if (!label || typeof label !== 'string') return '';
+    let cleaned = label;
+    // Garder uniquement la partie après "ORDONNANCE" si présent
+    const ordonnanceIndex = cleaned.indexOf('ORDONNANCE');
+    if (ordonnanceIndex !== -1) {
+      cleaned = cleaned.substring(ordonnanceIndex + 'ORDONNANCE'.length).trim();
     }
+    // Limiter à 280 caractères
+    if (cleaned.length > 280) {
+      cleaned = cleaned.substring(0, 280) + '...';
+    }
+    return cleaned;
+  };
+
+  const factsText = `
+IDENTITE:
+- Nom: ${personal.nom ?? "?"}
+- Prenom: ${personal.prenom ?? "?"}
+- Age: ${personal.age ?? "?"}
+
+ALERTES:
+- Allergies: ${personal.allergies?.join(", ") ?? "Aucune"}
+
+ORDONNANCES:
+${ordonnances.map(o => {
+  const cleanedActions = (o.actions || []).map(a => {
+    const cleanedLabel = cleanActionLabel(a.label);
+    return `${a.type ?? "autre"} - ${cleanedLabel} - scheduledAt=${a.scheduledAt ?? "null"}`;
   });
+  
+  return `
+- Ordonnance ${o.id} (${o.category ?? o.type ?? "?"}) date=${o.date ?? "?"}
+  Medecin: ${o.medecin?.prenom ?? ""} ${o.medecin?.nom ?? ""} ${o.medecin?.profession ?? ""}
+  Medicaments: ${(o.medicaments||[]).map(m=>`${m.medicament ?? m.nom ?? "?"} ${m.dosage ?? ""} ${m.posologie ?? m.frequence ?? ""} ${m.duration ?? m.duree ?? ""}`).join(" | ") || "Aucun"}
+  Actions: ${cleanedActions.join(" | ") || "Aucune"}
+`;
+}).join("\n")}
+`;
+
+  return factsText.trim();
+}
+
+/**
+ * Détecte le type d'action depuis une ordonnance
+ */
+function detectActionType(ord) {
+  const label = generateActionLabel(ord).toLowerCase();
+  
+  if (label.includes('radio') || label.includes('scanner') || label.includes('irm') || label.includes('échographie') || label.includes('imagerie')) {
+    return 'imagerie';
+  }
+  if (label.includes('prise de sang') || label.includes('analyse') || label.includes('laboratoire')) {
+    return 'analyse';
+  }
+  if (label.includes('consultation') || label.includes('rdv') || label.includes('rendez-vous')) {
+    return 'consultation';
+  }
+  return 'autre';
+}
+
+/**
+ * Génère un label pour une action
+ */
+function generateActionLabel(ord) {
+  // Si l'ordonnance contient des médicaments, essayer d'en déduire l'action
+  if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
+    const firstMed = ord.medicaments[0];
+    if (firstMed.nom) {
+      return firstMed.nom;
+    }
+  }
+  
+  // Sinon, utiliser un label générique
+  if (ord.type === 'rendez_vous') {
+    return 'Rendez-vous médical';
+  }
+  
+  return 'Action médicale';
+}
+
+/**
+ * Calcule le statut d'un traitement selon dates/durée
+ */
+function calculateTreatmentStatus(traitement, ordDate) {
+  if (!ordDate) return 'INCONNU';
+  
+  const startDate = new Date(ordDate);
+  if (isNaN(startDate.getTime())) return 'INCONNU';
+  
+  if (traitement.duree) {
+    // Parser la durée (ex: "7 jours", "1 mois")
+    const dureeMatch = traitement.duree.match(/(\d+)\s*(jour|jours|mois|semaine|semaines)/i);
+    if (dureeMatch) {
+      const value = parseInt(dureeMatch[1]);
+      const unit = dureeMatch[2].toLowerCase();
+      
+      let daysToAdd = 0;
+      if (unit.includes('jour')) daysToAdd = value;
+      else if (unit.includes('semaine')) daysToAdd = value * 7;
+      else if (unit.includes('mois')) daysToAdd = value * 30;
+      
+      const endDate = new Date(startDate);
+      endDate.setDate(endDate.getDate() + daysToAdd);
+      const now = new Date();
+      
+      if (now < startDate) return 'PLANIFIE';
+      if (now > endDate) return 'TERMINE';
+      return 'EN_COURS';
+    }
+  }
+  
+  // Si pas de durée, vérifier si la date est passée
+  const now = new Date();
+  if (now < startDate) return 'PLANIFIE';
+  // Si date passée sans durée, on ne peut pas savoir
+  return 'INCONNU';
+}
+
+/**
+ * Extrait le texte de la réponse OpenAI de manière robuste
+ */
+function extractTextFromOpenAIResponse(resp) {
+  // Responses API: resp.output_text
+  if (resp && typeof resp.output_text === "string" && resp.output_text.trim()) {
+    return resp.output_text.trim();
+  }
+
+  // Responses API alternative: resp.output[].content[].text
+  try {
+    const out = resp?.output;
+    if (Array.isArray(out)) {
+      for (const item of out) {
+        const content = item?.content;
+        if (Array.isArray(content)) {
+          for (const c of content) {
+            const t = c?.text;
+            if (typeof t === "string" && t.trim()) return t.trim();
+          }
+        }
+      }
+    }
+  } catch (_) {}
+
+  // Chat Completions: resp.choices[0].message.content
+  const chatText = resp?.choices?.[0]?.message?.content;
+  if (typeof chatText === "string" && chatText.trim()) return chatText.trim();
+
+  // fallback: empty string
+  return "";
+}
+
+/**
+ * Génère un résumé texte simple via OpenAI SDK
+ */
+async function generateSummaryText(factsText, openaiApiKey) {
+  const MAX_RETRIES = 2;
+  const TIMEOUT_MS = 60000;
+
+  const systemPrompt = `Tu fais une synthèse factuelle des ordonnances et infos déclarées. Aucun diagnostic, aucun conseil médical, aucune interprétation clinique. Tu peux reformuler et regrouper. Statut organisationnel possible: PLANIFIE si scheduledAt présent, sinon A_FAIRE. N'invente rien. Réponds uniquement par un texte simple en français, 2 à 5 phrases max.`;
+
+  const userPrompt = `Fais une synthèse simple et utile à partir de ces faits:\n\n${factsText}`;
+
+  const client = new OpenAI({ apiKey: openaiApiKey });
+
+  // Retry logic
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+    try {
+      console.log(`[AI_SUMMARY] Appel OpenAI (tentative ${attempt}/${MAX_RETRIES + 1})...`);
+      
+      // Gérer le timeout avec Promise.race
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('OpenAI API timeout after 60 seconds'));
+        }, TIMEOUT_MS);
+      });
+
+      const completion = await Promise.race([
+        client.chat.completions.create({
+          model: 'gpt-4o-mini',
+          temperature: 0.1,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ]
+        }),
+        timeoutPromise
+      ]);
+
+      // Logs de debug pour la structure de réponse
+      console.log("[AI_SUMMARY] OpenAI resp keys:", Object.keys(completion || {}));
+      console.log("[AI_SUMMARY] has output_text:", typeof completion?.output_text, "output_len:", completion?.output_text?.length || 0);
+      console.log("[AI_SUMMARY] has output array:", Array.isArray(completion?.output), "output_items:", completion?.output?.length || 0);
+      console.log("[AI_SUMMARY] has choices:", Array.isArray(completion?.choices), "choices_len:", completion?.choices?.length || 0);
+
+      // Extraire le texte de manière robuste
+      const summary = extractTextFromOpenAIResponse(completion);
+        
+      if (!summary || summary.length === 0) {
+        throw new Error('OpenAI response missing or invalid summary text');
+      }
+
+      console.log('[AI_SUMMARY] Résumé texte reçu avec succès');
+      return summary;
+
+    } catch (error) {
+      lastError = error;
+      console.warn(`[AI_SUMMARY] Tentative ${attempt} échouée:`, error.message);
+      if (attempt <= MAX_RETRIES) {
+        const delay = attempt * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+const aiSummaryHandler = async (req, res) => {
+  console.log('[AI_SUMMARY] HIT', req.method, req.originalUrl);
+  
+  try {
+    // Validation
+    const err = validateAiSummaryBody(req.body);
+    if (err) {
+      return res.status(400).json({ ok: false, error: 'INVALID_BODY', detail: err });
+    }
+
+    // Récupérer la clé OpenAI
+    const OPENAI_KEY = req.app.locals.OPENAI_API_KEY;
+    if (!OPENAI_KEY) {
+      console.error('[AI_SUMMARY] ❌ OPENAI_API_KEY absente');
+      return res.status(500).json({ 
+        ok: false, 
+        error: 'OPENAI_API_KEY_MISSING',
+        message: 'Clé API OpenAI non configurée'
+      });
+    }
+
+    // Construire le texte consolidé (facts only)
+    const factsText = buildFactsText(req.body.personal, req.body.ordonnances);
+    
+    console.log("[AI_SUMMARY] factsText length =", factsText.length);
+
+    // Générer le résumé texte via OpenAI
+    const summary = await generateSummaryText(factsText, OPENAI_KEY);
+    
+    if (!summary || summary.trim().length === 0) {
+      console.error('[AI_SUMMARY] ❌ Empty summary after extraction');
+      return res.status(500).json({
+        ok: false,
+        error: 'EMPTY_SUMMARY',
+        message: 'Le résumé généré est vide'
+      });
+    }
+    
+    console.log("[AI_SUMMARY] ✅ summaryLength =", summary.length);
+
+    // Retourner avec ok:true et summary
+    return res.status(200).json({
+      ok: true,
+      summary: summary,
+      serverBuild: "AI_SUMMARY_OPENAI_V2",
+      serverTime: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('[AI_SUMMARY] Erreur:', error.message);
+    if (error.stack) {
+      console.error('[AI_SUMMARY] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'OPENAI_ERROR',
+      message: 'Erreur lors de la génération du résumé médical'
+    });
+  }
 };
 
 app.get('/ai/medical-summary/health', (req, res) => res.status(200).json({ ok: true, path: req.originalUrl }));
 app.get('/ai/medical_summary/health', (req, res) => res.status(200).json({ ok: true, path: req.originalUrl }));
 app.post('/ai/medical-summary', aiSummaryHandler);
 app.post('/ai/medical_summary', aiSummaryHandler);
+app.post('/ai/medical-summary-v2', aiSummaryV2Handler);
+app.post('/ai/medical_summary_v2', aiSummaryV2Handler);
 
-console.log('✅ [AI_SUMMARY] routes registered');
+// ===== AI MEDICAL SUMMARY V2 (avec fallback garanti) =====
+/**
+ * Construit un texte court pour OpenAI (version simplifiée)
+ */
+function buildFactsTextShort(personal, ordonnances) {
+  const parts = [];
+  
+  // Nom
+  if (personal.nom || personal.prenom) {
+    const name = [personal.prenom, personal.nom].filter(Boolean).join(' ').toUpperCase();
+    if (name) parts.push(name);
+  }
+  
+  // Allergies
+  if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
+    parts.push(`Allergie renseignée : ${personal.allergies.join(', ')}.`);
+  }
+  
+  // Médicaments
+  const medicaments = [];
+  ordonnances.forEach(ord => {
+    if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
+      ord.medicaments.forEach(med => {
+        const medName = med.medicament || med.nom || '';
+        const dosage = med.dosage || '';
+        if (medName) {
+          medicaments.push(`${medName}${dosage ? ' ' + dosage : ''}`);
+        }
+      });
+    }
+  });
+  
+  if (medicaments.length > 0) {
+    parts.push(`Ordonnance de ${medicaments.join(' et ')}.`);
+  }
+  
+  // Actions
+  const actions = [];
+  ordonnances.forEach(ord => {
+    if (Array.isArray(ord.actions) && ord.actions.length > 0) {
+      ord.actions.forEach(action => {
+        const label = action.label || '';
+        const scheduledAt = action.scheduledAt;
+        const status = scheduledAt ? 'PLANIFIE' : 'A_FAIRE';
+        if (label) {
+          actions.push(`${label} (${status})`);
+        }
+      });
+    }
+  });
+  
+  if (actions.length > 0) {
+    const actionText = actions.length === 1 
+      ? `Une ${actions[0].toLowerCase()} est planifiée.`
+      : `Actions : ${actions.join(', ')}.`;
+    parts.push(actionText);
+  }
+  
+  return parts.join(' ');
+}
+
+/**
+ * Génère un résumé fallback déterministe
+ */
+function generateFallbackSummary(personal, ordonnances) {
+  const parts = [];
+  
+  // Nom
+  if (personal.nom || personal.prenom) {
+    const name = [personal.prenom, personal.nom].filter(Boolean).join(' ').toUpperCase();
+    if (name) parts.push(`${name} a`);
+  } else {
+    parts.push('Le patient a');
+  }
+  
+  // Médicaments
+  const medicaments = [];
+  ordonnances.forEach(ord => {
+    if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
+      ord.medicaments.forEach(med => {
+        const medName = med.medicament || med.nom || '';
+        const dosage = med.dosage || '';
+        if (medName) {
+          medicaments.push(`${medName}${dosage ? ' ' + dosage : ''}`);
+        }
+      });
+    }
+  });
+  
+  if (medicaments.length > 0) {
+    parts.push(`une ordonnance de ${medicaments.join(' et ')}.`);
+  }
+  
+  // Actions
+  const actions = [];
+  ordonnances.forEach(ord => {
+    if (Array.isArray(ord.actions) && ord.actions.length > 0) {
+      ord.actions.forEach(action => {
+        const label = action.label || '';
+        const scheduledAt = action.scheduledAt;
+        if (label) {
+          if (scheduledAt) {
+            actions.push(`Une imagerie est planifiée (${label.toLowerCase()})`);
+          } else {
+            actions.push(`Une action est à faire (${label.toLowerCase()})`);
+          }
+        }
+      });
+    }
+  });
+  
+  if (actions.length > 0) {
+    parts.push(actions.join('. ') + '.');
+  }
+  
+  // Allergies
+  if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
+    parts.push(`Allergie renseignée : ${personal.allergies.join(', ')}.`);
+  }
+  
+  return parts.join(' ') || 'Aucune information médicale disponible.';
+}
+
+const aiSummaryV2Handler = async (req, res) => {
+  console.log('[AI_SUMMARY_V2] HIT', req.method, req.originalUrl);
+  
+  try {
+    // Validation
+    const err = validateAiSummaryBody(req.body);
+    if (err) {
+      return res.status(400).json({ ok: false, error: 'INVALID_BODY', detail: err });
+    }
+
+    // Générer un résumé fallback déterministe (sans OpenAI pour l'instant)
+    const personal = req.body.personal;
+    const ordonnances = req.body.ordonnances;
+    
+    const parts = [];
+    
+    // Nom
+    const nom = [personal.prenom, personal.nom].filter(Boolean).join(' ').trim();
+    if (nom) {
+      parts.push(nom.toUpperCase());
+    }
+    
+    // Compter médicaments
+    const medicaments = [];
+    ordonnances.forEach(ord => {
+      if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
+        ord.medicaments.forEach(med => {
+          const medName = med.medicament || med.nom || '';
+          const dosage = med.dosage || '';
+          if (medName) {
+            medicaments.push(`${medName}${dosage ? ' ' + dosage : ''}`);
+          }
+        });
+      }
+    });
+    
+    if (medicaments.length > 0) {
+      const medCount = medicaments.length;
+      parts.push(`a ${medCount} médicament(s): ${medicaments.join(', ')}`);
+    }
+    
+    // Compter actions
+    const actions = [];
+    ordonnances.forEach(ord => {
+      if (Array.isArray(ord.actions) && ord.actions.length > 0) {
+        ord.actions.forEach(action => {
+          let label = action.label || '';
+          // Prendre après "ORDONNANCE" si présent
+          const ordonnanceIndex = label.indexOf('ORDONNANCE');
+          if (ordonnanceIndex !== -1) {
+            label = label.substring(ordonnanceIndex + 'ORDONNANCE'.length).trim();
+          }
+          const scheduledAt = action.scheduledAt;
+          const status = scheduledAt ? 'PLANIFIE' : 'A_FAIRE';
+          if (label) {
+            actions.push(`${label} (${status})`);
+          }
+        });
+      }
+    });
+    
+    if (actions.length > 0) {
+      const actionCount = actions.length;
+      parts.push(`${actionCount} action(s): ${actions.join(', ')}`);
+    }
+    
+    // Allergies
+    if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
+      parts.push(`Allergies: ${personal.allergies.join(', ')}`);
+    }
+    
+    // Construire le summary
+    let summary = parts.join(' ; ');
+    if (!summary || summary.trim().length === 0) {
+      summary = 'Aucune information médicale disponible.';
+    }
+    
+    console.log("[AI_SUMMARY_V2] source=fallback summaryLength =", summary.length);
+
+    // Toujours retourner 200 avec summary non vide
+    return res.status(200).json({
+      ok: true,
+      summary: summary,
+      source: 'fallback',
+      serverBuild: "AI_SUMMARY_V2"
+    });
+
+  } catch (error) {
+    console.error('[AI_SUMMARY_V2] Erreur:', error.message);
+    if (error.stack) {
+      console.error('[AI_SUMMARY_V2] Stack:', error.stack);
+    }
+    
+    // Même en cas d'erreur, générer un fallback minimal
+    return res.status(200).json({
+      ok: true,
+      summary: 'Résumé médical non disponible.',
+      source: 'fallback',
+      serverBuild: "AI_SUMMARY_V2"
+    });
+  }
+};
 
 // Handler 404 pour les routes non trouvées (catch-all)
 app.use((req, res) => {
@@ -2762,27 +3261,29 @@ app.use((req, res) => {
   
   // Liste des routes disponibles
   const availableRoutes = [
-    'GET /health',
-    'GET /ping',
+      'GET /health',
+      'GET /ping',
     'GET /version',
     'GET /beacon',
     'GET /healthz',
-    'POST /extract',
+      'POST /extract',
     'GET /ai/medical-summary/health',
     'GET /ai/medical_summary/health',
     'POST /ai/medical-summary',
     'POST /ai/medical_summary',
-    'POST /analyze-ordonnance',
-    'POST /analyze-ordonnance-test',
-    'GET /test-n8n',
-    'POST /api/ocr/handwritten',
-    'POST /api/ordonnances/create',
-    'POST /api/ordonnance/ocr',
-    'POST /api/ordonnance/analyze',
-    'POST /api/ordonnance/photo',
-    'POST /api/ordonnance/finalize',
-    'POST /ocr-photo',
-    'GET /api/ordonnances'
+    'POST /ai/medical-summary-v2',
+    'POST /ai/medical_summary_v2',
+      'POST /analyze-ordonnance',
+      'POST /analyze-ordonnance-test',
+      'GET /test-n8n',
+      'POST /api/ocr/handwritten',
+      'POST /api/ordonnances/create',
+      'POST /api/ordonnance/ocr',
+      'POST /api/ordonnance/analyze',
+      'POST /api/ordonnance/photo',
+      'POST /api/ordonnance/finalize',
+      'POST /ocr-photo',
+      'GET /api/ordonnances'
   ];
   
   res.status(404).json({ 
