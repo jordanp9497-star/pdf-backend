@@ -3022,6 +3022,112 @@ const aiSummaryHandler = async (req, res) => {
   }
 };
 
+// ===== AI MEDICAL SUMMARY V2 HANDLER (hoistée pour éviter TDZ) =====
+async function aiSummaryV2Handler(req, res) {
+  console.log('[AI_SUMMARY_V2] HIT', req.method, req.originalUrl);
+  
+  try {
+    // Validation
+    const err = validateAiSummaryBody(req.body);
+    if (err) {
+      return res.status(400).json({ ok: false, error: 'INVALID_BODY', detail: err });
+    }
+
+    // Générer un résumé fallback déterministe (sans OpenAI pour l'instant)
+    const personal = req.body.personal;
+    const ordonnances = req.body.ordonnances;
+    
+    const parts = [];
+    
+    // Nom
+    const nom = [personal.prenom, personal.nom].filter(Boolean).join(' ').trim();
+    if (nom) {
+      parts.push(nom.toUpperCase());
+    }
+    
+    // Compter médicaments
+    const medicaments = [];
+    ordonnances.forEach(ord => {
+      if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
+        ord.medicaments.forEach(med => {
+          const medName = med.medicament || med.nom || '';
+          const dosage = med.dosage || '';
+          if (medName) {
+            medicaments.push(`${medName}${dosage ? ' ' + dosage : ''}`);
+          }
+        });
+      }
+    });
+    
+    if (medicaments.length > 0) {
+      const medCount = medicaments.length;
+      parts.push(`a ${medCount} médicament(s): ${medicaments.join(', ')}`);
+    }
+    
+    // Compter actions
+    const actions = [];
+    ordonnances.forEach(ord => {
+      if (Array.isArray(ord.actions) && ord.actions.length > 0) {
+        ord.actions.forEach(action => {
+          let label = action.label || '';
+          // Prendre après "ORDONNANCE" si présent
+          const ordonnanceIndex = label.indexOf('ORDONNANCE');
+          if (ordonnanceIndex !== -1) {
+            label = label.substring(ordonnanceIndex + 'ORDONNANCE'.length).trim();
+          }
+          const scheduledAt = action.scheduledAt;
+          const status = scheduledAt ? 'PLANIFIE' : 'A_FAIRE';
+          if (label) {
+            actions.push(`${label} (${status})`);
+          }
+        });
+      }
+    });
+    
+    if (actions.length > 0) {
+      const actionCount = actions.length;
+      parts.push(`${actionCount} action(s): ${actions.join(', ')}`);
+    }
+    
+    // Allergies
+    if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
+      parts.push(`Allergies: ${personal.allergies.join(', ')}`);
+    }
+    
+    // Construire le summary
+    let summary = parts.join(' ; ');
+    if (!summary || summary.trim().length === 0) {
+      summary = 'Aucune information médicale disponible.';
+    }
+    
+    console.log("[AI_SUMMARY_V2] source=fallback summaryLength =", summary.length);
+
+    // Toujours retourner 200 avec summary non vide
+    return res.status(200).json({
+      ok: true,
+      summary: summary,
+      source: 'fallback',
+      serverBuild: "AI_SUMMARY_V2"
+    });
+
+  } catch (error) {
+    console.error('[AI_SUMMARY_V2] Erreur:', error.message);
+    if (error.stack) {
+      console.error('[AI_SUMMARY_V2] Stack:', error.stack);
+    }
+    
+    // Même en cas d'erreur, générer un fallback minimal
+    return res.status(200).json({
+      ok: true,
+      summary: 'Résumé médical non disponible.',
+      source: 'fallback',
+      serverBuild: "AI_SUMMARY_V2"
+    });
+  }
+}
+
+console.log('✅ [AI_SUMMARY_V2] handler ready');
+
 app.get('/ai/medical-summary/health', (req, res) => res.status(200).json({ ok: true, path: req.originalUrl }));
 app.get('/ai/medical_summary/health', (req, res) => res.status(200).json({ ok: true, path: req.originalUrl }));
 app.post('/ai/medical-summary', aiSummaryHandler);
@@ -3152,108 +3258,6 @@ function generateFallbackSummary(personal, ordonnances) {
   return parts.join(' ') || 'Aucune information médicale disponible.';
 }
 
-const aiSummaryV2Handler = async (req, res) => {
-  console.log('[AI_SUMMARY_V2] HIT', req.method, req.originalUrl);
-  
-  try {
-    // Validation
-    const err = validateAiSummaryBody(req.body);
-    if (err) {
-      return res.status(400).json({ ok: false, error: 'INVALID_BODY', detail: err });
-    }
-
-    // Générer un résumé fallback déterministe (sans OpenAI pour l'instant)
-    const personal = req.body.personal;
-    const ordonnances = req.body.ordonnances;
-    
-    const parts = [];
-    
-    // Nom
-    const nom = [personal.prenom, personal.nom].filter(Boolean).join(' ').trim();
-    if (nom) {
-      parts.push(nom.toUpperCase());
-    }
-    
-    // Compter médicaments
-    const medicaments = [];
-    ordonnances.forEach(ord => {
-      if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
-        ord.medicaments.forEach(med => {
-          const medName = med.medicament || med.nom || '';
-          const dosage = med.dosage || '';
-          if (medName) {
-            medicaments.push(`${medName}${dosage ? ' ' + dosage : ''}`);
-          }
-        });
-      }
-    });
-    
-    if (medicaments.length > 0) {
-      const medCount = medicaments.length;
-      parts.push(`a ${medCount} médicament(s): ${medicaments.join(', ')}`);
-    }
-    
-    // Compter actions
-    const actions = [];
-    ordonnances.forEach(ord => {
-      if (Array.isArray(ord.actions) && ord.actions.length > 0) {
-        ord.actions.forEach(action => {
-          let label = action.label || '';
-          // Prendre après "ORDONNANCE" si présent
-          const ordonnanceIndex = label.indexOf('ORDONNANCE');
-          if (ordonnanceIndex !== -1) {
-            label = label.substring(ordonnanceIndex + 'ORDONNANCE'.length).trim();
-          }
-          const scheduledAt = action.scheduledAt;
-          const status = scheduledAt ? 'PLANIFIE' : 'A_FAIRE';
-          if (label) {
-            actions.push(`${label} (${status})`);
-          }
-        });
-      }
-    });
-    
-    if (actions.length > 0) {
-      const actionCount = actions.length;
-      parts.push(`${actionCount} action(s): ${actions.join(', ')}`);
-    }
-    
-    // Allergies
-    if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
-      parts.push(`Allergies: ${personal.allergies.join(', ')}`);
-    }
-    
-    // Construire le summary
-    let summary = parts.join(' ; ');
-    if (!summary || summary.trim().length === 0) {
-      summary = 'Aucune information médicale disponible.';
-    }
-    
-    console.log("[AI_SUMMARY_V2] source=fallback summaryLength =", summary.length);
-
-    // Toujours retourner 200 avec summary non vide
-    return res.status(200).json({
-      ok: true,
-      summary: summary,
-      source: 'fallback',
-      serverBuild: "AI_SUMMARY_V2"
-    });
-
-  } catch (error) {
-    console.error('[AI_SUMMARY_V2] Erreur:', error.message);
-    if (error.stack) {
-      console.error('[AI_SUMMARY_V2] Stack:', error.stack);
-    }
-    
-    // Même en cas d'erreur, générer un fallback minimal
-    return res.status(200).json({
-      ok: true,
-      summary: 'Résumé médical non disponible.',
-      source: 'fallback',
-      serverBuild: "AI_SUMMARY_V2"
-    });
-  }
-};
 
 // Handler 404 pour les routes non trouvées (catch-all)
 app.use((req, res) => {
