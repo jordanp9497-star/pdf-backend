@@ -400,7 +400,7 @@ app.get('/favicon.ico', (req, res) => {
 // Route GET /ping
 app.get('/ping', (req, res) => {
   console.log('PING OK');
-  res.json({ status: 'OK', source: 'backend' });
+  res.status(200).json({ status: 'OK' });
 });
 
 // Route GET /__build - Build signature endpoint
@@ -413,16 +413,17 @@ app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'ok',
     timestamp: Date.now(),
-    serverBuild: 'AI_SUMMARY_V2_DEPLOY'
+    serverBuild: 'AI_SUMMARY_V2_INLINE'
   });
 });
 
 // Route GET /version - Version info endpoint
 app.get('/version', (req, res) => {
   res.status(200).json({
-    name: 'pdf-backend',
-    time: Date.now(),
-    env: process.env.NODE_ENV || null
+    ok: true,
+    service: 'pdf-backend',
+    serverBuild: 'AI_SUMMARY_V2_INLINE',
+    timestamp: Date.now()
   });
 });
 
@@ -3033,19 +3034,90 @@ async function aiSummaryV2Handler(req, res) {
       return res.status(400).json({ ok: false, error: 'INVALID_BODY', detail: err });
     }
 
-    // Générer un résumé fallback déterministe (sans OpenAI pour l'instant)
     const personal = req.body.personal;
     const ordonnances = req.body.ordonnances;
     
-    const parts = [];
+    // Construire factsText pour OpenAI
+    const factsParts = [];
     
-    // Nom
-    const nom = [personal.prenom, personal.nom].filter(Boolean).join(' ').trim();
-    if (nom) {
-      parts.push(nom.toUpperCase());
+    // Identité
+    const nomParts = [];
+    if (personal.nom) nomParts.push(personal.nom.toUpperCase());
+    if (personal.prenom) nomParts.push(personal.prenom);
+    if (nomParts.length > 0) {
+      factsParts.push(`Identité: ${nomParts.join(' ')}`);
     }
     
-    // Compter médicaments
+    // Allergies
+    if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
+      factsParts.push(`Allergies: ${personal.allergies.join(', ')}`);
+    }
+    
+    // Médicaments
+    const medLines = [];
+    ordonnances.forEach(ord => {
+      if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
+        ord.medicaments.forEach(med => {
+          const medParts = [];
+          if (med.medicament || med.nom) medParts.push(med.medicament || med.nom);
+          if (med.dosage) medParts.push(med.dosage);
+          if (med.posologie || med.frequence) medParts.push(med.posologie || med.frequence);
+          if (med.duration || med.duree) medParts.push(med.duration || med.duree);
+          if (medParts.length > 0) {
+            medLines.push(`- ${medParts.join(' - ')}`);
+          }
+        });
+      }
+    });
+    if (medLines.length > 0) {
+      factsParts.push('Médicaments:');
+      factsParts.push(...medLines);
+    }
+    
+    // Actions/RDV
+    const actionLines = [];
+    ordonnances.forEach(ord => {
+      if (Array.isArray(ord.actions) && ord.actions.length > 0) {
+        ord.actions.forEach(action => {
+          let label = action.label || '';
+          
+          // Extraire une phrase courte du label
+          if (label.includes('Faire réaliser')) {
+            const index = label.indexOf('Faire réaliser');
+            label = label.substring(index).trim();
+          } else if (label.includes('ORDONNANCE')) {
+            const index = label.indexOf('ORDONNANCE');
+            label = label.substring(index + 'ORDONNANCE'.length).trim();
+          }
+          
+          // Limiter à 180 caractères
+          if (label.length > 180) {
+            label = label.substring(0, 180) + '...';
+          }
+          
+          const scheduledAt = action.scheduledAt;
+          const status = scheduledAt ? 'PLANIFIE' : 'A_FAIRE';
+          
+          if (label) {
+            actionLines.push(`- ${label} (${status})`);
+          }
+        });
+      }
+    });
+    if (actionLines.length > 0) {
+      factsParts.push('Actions/RDV:');
+      factsParts.push(...actionLines);
+    }
+    
+    const factsText = factsParts.join('\n');
+    
+    // Générer le résumé fallback (toujours disponible)
+    const fallbackParts = [];
+    const nom = [personal.prenom, personal.nom].filter(Boolean).join(' ').trim();
+    if (nom) {
+      fallbackParts.push(nom.toUpperCase());
+    }
+    
     const medicaments = [];
     ordonnances.forEach(ord => {
       if (Array.isArray(ord.medicaments) && ord.medicaments.length > 0) {
@@ -3061,16 +3133,14 @@ async function aiSummaryV2Handler(req, res) {
     
     if (medicaments.length > 0) {
       const medCount = medicaments.length;
-      parts.push(`a ${medCount} médicament(s): ${medicaments.join(', ')}`);
+      fallbackParts.push(`a ${medCount} médicament(s): ${medicaments.join(', ')}`);
     }
     
-    // Compter actions
     const actions = [];
     ordonnances.forEach(ord => {
       if (Array.isArray(ord.actions) && ord.actions.length > 0) {
         ord.actions.forEach(action => {
           let label = action.label || '';
-          // Prendre après "ORDONNANCE" si présent
           const ordonnanceIndex = label.indexOf('ORDONNANCE');
           if (ordonnanceIndex !== -1) {
             label = label.substring(ordonnanceIndex + 'ORDONNANCE'.length).trim();
@@ -3086,28 +3156,72 @@ async function aiSummaryV2Handler(req, res) {
     
     if (actions.length > 0) {
       const actionCount = actions.length;
-      parts.push(`${actionCount} action(s): ${actions.join(', ')}`);
+      fallbackParts.push(`${actionCount} action(s): ${actions.join(', ')}`);
     }
     
-    // Allergies
     if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
-      parts.push(`Allergies: ${personal.allergies.join(', ')}`);
+      fallbackParts.push(`Allergies: ${personal.allergies.join(', ')}`);
     }
     
-    // Construire le summary
-    let summary = parts.join(' ; ');
+    let fallbackSummary = fallbackParts.join(' ; ');
+    if (!fallbackSummary || fallbackSummary.trim().length === 0) {
+      fallbackSummary = 'Aucune information médicale disponible.';
+    }
+    
+    // Tenter OpenAI
+    let summary = '';
+    let source = 'fallback';
+    
+    const OPENAI_KEY = process.env.OPENAI_API_KEY || req.app.locals?.OPENAI_API_KEY;
+    
+    if (OPENAI_KEY) {
+      try {
+        const client = new OpenAI({ apiKey: OPENAI_KEY });
+        
+        const systemPrompt = `Tu fais une synthèse factuelle. Aucun diagnostic, aucun conseil médical, aucune interprétation clinique. N'invente rien. Structure la réponse en 3 à 6 puces, courtes.`;
+        
+        const completion = await Promise.race([
+          client.chat.completions.create({
+            model: 'gpt-4o-mini',
+            temperature: 0.1,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: factsText }
+            ]
+          }),
+          new Promise((_, reject) => {
+            setTimeout(() => {
+              reject(new Error('OpenAI API timeout after 60 seconds'));
+            }, 60000);
+          })
+        ]);
+        
+        // Extraire le texte de manière robuste
+        summary = extractTextFromOpenAIResponse(completion);
+        
+        if (summary && summary.trim().length > 0) {
+          source = 'openai';
+        }
+      } catch (openaiError) {
+        console.warn('[AI_SUMMARY_V2] OpenAI error:', openaiError.message);
+      }
+    }
+    
+    // Si OpenAI n'a pas fourni de texte, utiliser le fallback
     if (!summary || summary.trim().length === 0) {
-      summary = 'Aucune information médicale disponible.';
+      summary = fallbackSummary;
+      source = 'fallback';
     }
     
-    console.log("[AI_SUMMARY_V2] source=fallback summaryLength =", summary.length);
+    console.log("[AI_SUMMARY_V2] source=", source, "summaryLength=", summary.length);
 
     // Toujours retourner 200 avec summary non vide
     return res.status(200).json({
       ok: true,
       summary: summary,
-      source: 'fallback',
-      serverBuild: "AI_SUMMARY_V2"
+      source: source,
+      serverBuild: "AI_SUMMARY_V2",
+      serverTime: new Date().toISOString()
     });
 
   } catch (error) {
@@ -3121,7 +3235,8 @@ async function aiSummaryV2Handler(req, res) {
       ok: true,
       summary: 'Résumé médical non disponible.',
       source: 'fallback',
-      serverBuild: "AI_SUMMARY_V2"
+      serverBuild: "AI_SUMMARY_V2",
+      serverTime: new Date().toISOString()
     });
   }
 }
