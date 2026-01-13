@@ -423,7 +423,9 @@ app.get('/version', (req, res) => {
     ok: true,
     service: 'pdf-backend',
     serverBuild: 'AI_SUMMARY_V2_INLINE',
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    passportSecretLoaded: Boolean(process.env.PASSPORT_QR_SECRET),
+    qrSecretLoaded: Boolean(process.env.QR_SECRET)
   });
 });
 
