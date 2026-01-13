@@ -41,7 +41,7 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHmac } from 'crypto';
 import OpenAI from 'openai';
 
 const app = express();
@@ -3373,6 +3373,244 @@ function generateFallbackSummary(personal, ordonnances) {
   return parts.join(' ') || 'Aucune information médicale disponible.';
 }
 
+// ===== QR CODE API (Token signé pour ordonnances) =====
+// Génère un token signé pour une ordonnance
+function generateQRToken(ordonnanceId) {
+  const QR_SECRET = process.env.QR_SECRET || 'default-secret-change-in-production';
+  const expiresIn = 7 * 24 * 60 * 60 * 1000; // 7 jours en millisecondes
+  const expiresAt = Date.now() + expiresIn;
+  
+  // Payload: id + exp (pas de données médicales)
+  const payload = {
+    id: ordonnanceId,
+    exp: expiresAt
+  };
+  
+  // Encoder le payload en base64
+  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  
+  // Générer la signature HMAC
+  const hmac = createHmac('sha256', QR_SECRET);
+  hmac.update(payloadBase64);
+  const signature = hmac.digest('base64url');
+  
+  // Token = payload.signature
+  const token = `${payloadBase64}.${signature}`;
+  
+  return { token, expiresAt: new Date(expiresAt).toISOString() };
+}
+
+// Vérifie et résout un token QR
+function verifyQRToken(token) {
+  try {
+    const QR_SECRET = process.env.QR_SECRET || 'default-secret-change-in-production';
+    
+    // Séparer payload et signature
+    const [payloadBase64, signature] = token.split('.');
+    if (!payloadBase64 || !signature) {
+      return { valid: false, error: 'INVALID_TOKEN_FORMAT' };
+    }
+    
+    // Vérifier la signature
+    const hmac = createHmac('sha256', QR_SECRET);
+    hmac.update(payloadBase64);
+    const expectedSignature = hmac.digest('base64url');
+    
+    if (signature !== expectedSignature) {
+      return { valid: false, error: 'INVALID_SIGNATURE' };
+    }
+    
+    // Décoder le payload
+    const payload = JSON.parse(Buffer.from(payloadBase64, 'base64url').toString('utf8'));
+    
+    // Vérifier l'expiration
+    if (Date.now() > payload.exp) {
+      return { valid: false, error: 'TOKEN_EXPIRED' };
+    }
+    
+    return { valid: true, ordonnanceId: payload.id };
+  } catch (error) {
+    return { valid: false, error: 'TOKEN_PARSE_ERROR' };
+  }
+}
+
+// Route GET /api/ordonnances/:id/qr - Générer un token QR pour une ordonnance
+app.get('/api/ordonnances/:id/qr', (req, res) => {
+  console.log('[QR] GET /api/ordonnances/:id/qr appelée');
+  
+  try {
+    const ordonnanceId = req.params.id;
+    
+    if (!ordonnanceId || typeof ordonnanceId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_ORDONNANCE_ID',
+        message: 'ID d\'ordonnance invalide'
+      });
+    }
+    
+    // Générer le token signé
+    const { token, expiresAt } = generateQRToken(ordonnanceId);
+    
+    // Construire le payload QR
+    const qrPayload = `medicalia://ordonnance/${ordonnanceId}?t=${token}`;
+    
+    console.log(`[QR] ✅ Token généré pour ordonnance: ${ordonnanceId}`);
+    
+    return res.status(200).json({
+      ok: true,
+      ordonnanceId,
+      qrPayload,
+      expiresAt
+    });
+    
+  } catch (error) {
+    console.error('[QR] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[QR] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'QR_GENERATION_FAILED',
+      message: 'Erreur lors de la génération du token QR'
+    });
+  }
+});
+
+// Route GET /api/qr/resolve - Résoudre un token QR
+app.get('/api/qr/resolve', (req, res) => {
+  console.log('[QR] GET /api/qr/resolve appelée');
+  
+  try {
+    const token = req.query.t;
+    
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'TOKEN_MISSING',
+        message: 'Le paramètre "t" (token) est requis'
+      });
+    }
+    
+    // Vérifier le token
+    const result = verifyQRToken(token);
+    
+    if (!result.valid) {
+      return res.status(400).json({
+        ok: false,
+        error: result.error,
+        message: `Token invalide: ${result.error}`
+      });
+    }
+    
+    console.log(`[QR] ✅ Token résolu: ordonnanceId=${result.ordonnanceId}`);
+    
+    return res.status(200).json({
+      ok: true,
+      ordonnanceId: result.ordonnanceId
+    });
+    
+  } catch (error) {
+    console.error('[QR] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[QR] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'QR_RESOLVE_FAILED',
+      message: 'Erreur lors de la résolution du token QR'
+    });
+  }
+});
+
+// ===== DELIVERIES API (MVP) =====
+// Stockage temporaire des livraisons (en mémoire)
+const deliveriesStorage = new Map();
+
+// Validation du body pour créer une livraison
+function validateDeliveryBody(body) {
+  if (!body || typeof body !== 'object') return 'BODY_MISSING';
+  if (!body.ordonnanceId || typeof body.ordonnanceId !== 'string') return 'ORDONNANCE_ID_MISSING';
+  if (!body.pharmacy || typeof body.pharmacy !== 'object') return 'PHARMACY_MISSING';
+  if (!body.pharmacy.name || typeof body.pharmacy.name !== 'string') return 'PHARMACY_NAME_MISSING';
+  if (!body.deliveryAddress || typeof body.deliveryAddress !== 'object') return 'DELIVERY_ADDRESS_MISSING';
+  if (!body.deliveryAddress.line1 || typeof body.deliveryAddress.line1 !== 'string') return 'DELIVERY_ADDRESS_LINE1_MISSING';
+  if (!body.deliveryAddress.city || typeof body.deliveryAddress.city !== 'string') return 'DELIVERY_ADDRESS_CITY_MISSING';
+  if (!body.deliveryAddress.postalCode || typeof body.deliveryAddress.postalCode !== 'string') return 'DELIVERY_ADDRESS_POSTAL_CODE_MISSING';
+  if (!body.contact || typeof body.contact !== 'object') return 'CONTACT_MISSING';
+  if (!body.contact.name || typeof body.contact.name !== 'string') return 'CONTACT_NAME_MISSING';
+  if (!body.contact.phone || typeof body.contact.phone !== 'string') return 'CONTACT_PHONE_MISSING';
+  return null;
+}
+
+// Route POST /api/deliveries/create - Créer une demande de livraison
+app.post('/api/deliveries/create', (req, res) => {
+  console.log('[DELIVERIES] POST /api/deliveries/create appelée');
+  
+  try {
+    // Validation
+    const err = validateDeliveryBody(req.body);
+    if (err) {
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_BODY',
+        detail: err
+      });
+    }
+
+    // Générer un ID unique pour la livraison
+    const deliveryId = `delivery_${randomUUID()}`;
+    
+    // Créer l'objet livraison
+    const delivery = {
+      deliveryId,
+      ordonnanceId: req.body.ordonnanceId,
+      pharmacy: {
+        name: req.body.pharmacy.name,
+        address: req.body.pharmacy.address || null,
+        lat: req.body.pharmacy.lat || null,
+        lng: req.body.pharmacy.lng || null
+      },
+      deliveryAddress: {
+        line1: req.body.deliveryAddress.line1,
+        city: req.body.deliveryAddress.city,
+        postalCode: req.body.deliveryAddress.postalCode
+      },
+      contact: {
+        name: req.body.contact.name,
+        phone: req.body.contact.phone
+      },
+      status: 'CREATED',
+      createdAt: new Date().toISOString()
+    };
+
+    // Stocker en mémoire
+    deliveriesStorage.set(deliveryId, delivery);
+    
+    console.log(`[DELIVERIES] ✅ Livraison créée: ${deliveryId} (total: ${deliveriesStorage.size})`);
+
+    // Retourner la réponse
+    return res.status(200).json({
+      ok: true,
+      deliveryId,
+      status: 'CREATED'
+    });
+
+  } catch (error) {
+    console.error('[DELIVERIES] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[DELIVERIES] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'DELIVERY_CREATION_FAILED',
+      message: 'Erreur lors de la création de la demande de livraison'
+    });
+  }
+});
 
 // Handler 404 pour les routes non trouvées (catch-all)
 app.use((req, res) => {
@@ -3402,7 +3640,10 @@ app.use((req, res) => {
       'POST /api/ordonnance/photo',
       'POST /api/ordonnance/finalize',
       'POST /ocr-photo',
-      'GET /api/ordonnances'
+      'GET /api/ordonnances',
+      'GET /api/ordonnances/:id/qr',
+      'GET /api/qr/resolve',
+      'POST /api/deliveries/create'
   ];
   
   res.status(404).json({ 
