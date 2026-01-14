@@ -429,6 +429,27 @@ app.get('/version', (req, res) => {
   });
 });
 
+// Route GET /billing/plan - Récupérer le plan utilisateur (mock)
+// Documentation:
+// - Endpoint simple pour préparer l'intégration future de la facturation
+// - Retourne actuellement un plan hardcodé "FREE"
+// - Pas d'authentification pour l'instant (sera ajoutée plus tard)
+// - Headers no-store pour éviter la mise en cache
+// - Plus tard: intégration avec auth + store receipts (App Store/Play Store)
+app.get('/billing/plan', (req, res) => {
+  // Headers de cache: no-store pour éviter la mise en cache
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
+  });
+  
+  // Plan mock hardcodé (sera remplacé par une vraie logique plus tard)
+  res.status(200).json({
+    plan: 'FREE'
+  });
+});
+
 // Route GET /beacon - Beacon endpoint (silencieux pour éviter 404)
 app.get('/beacon', (req, res) => {
   res.status(204).end();
@@ -3552,45 +3573,63 @@ app.get('/api/qr/resolve', (req, res) => {
   }
 });
 
-// Route GET /o/:token - Page web pour QR code ordonnance
-app.get('/o/:token', (req, res) => {
-  console.log('[QR_WEB] GET /o/:token appelée');
+// ===== WEB QR PAGES (Mini site pour scans QR universels) =====
+
+// Helper: Détecter le type d'appareil depuis user-agent
+function detectDevice(userAgent) {
+  if (!userAgent) return 'desktop';
   
-  try {
-    const token = req.params.token;
-    
-    if (!token || typeof token !== 'string') {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html lang="fr">
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Erreur - Medicalia</title>
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 40px 20px; }
-            h1 { color: #333; }
-            p { color: #666; }
-          </style>
-        </head>
-        <body>
-          <h1>Erreur</h1>
-          <p>Token invalide</p>
-        </body>
-        </html>
-      `);
-    }
-    
-    // Construire le deep link (on ne connaît pas l'ordonnanceId, donc on utilise juste le token)
-    const deepLink = `medicalia://ordonnance?t=${token}`;
-    
-    const html = `
-<!DOCTYPE html>
+  const ua = userAgent.toLowerCase();
+  
+  if (/iphone|ipad|ipod/.test(ua)) {
+    return 'ios';
+  }
+  
+  if (/android/.test(ua)) {
+    return 'android';
+  }
+  
+  return 'desktop';
+}
+
+// Helper: Générer le lien store selon l'appareil
+function getStoreLink(device) {
+  // TODO: Remplacer par les vrais liens App Store / Play Store quand disponibles
+  const STORE_LINKS = {
+    ios: 'https://apps.apple.com/app/medicalia', // TODO: Lien App Store réel
+    android: 'https://play.google.com/store/apps/details?id=com.medicalia.app', // TODO: Lien Play Store réel
+    desktop: null // Pas de store sur desktop
+  };
+  
+  return STORE_LINKS[device] || null;
+}
+
+// Helper: Générer le HTML de la page QR
+function generateQRPageHTML(options) {
+  const {
+    title,
+    subtitle,
+    icon,
+    deepLink,
+    storeLink,
+    device,
+    tokenPrefix
+  } = options;
+  
+  const hasStoreLink = storeLink !== null;
+  const storeButtonHTML = hasStoreLink 
+    ? `<a href="${storeLink}" class="store-button" target="_blank" rel="noopener noreferrer">Installer l'app</a>`
+    : '<p class="info-text">Installez l\'app Medicalia depuis l\'App Store ou Google Play.</p>';
+  
+  return `<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ordonnance Medicalia</title>
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, proxy-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>${title} - Medicalia</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -3611,6 +3650,10 @@ app.get('/o/:token', (req, res) => {
       box-shadow: 0 20px 60px rgba(0,0,0,0.3);
       text-align: center;
     }
+    .logo {
+      font-size: 48px;
+      margin-bottom: 20px;
+    }
     h1 {
       color: #333;
       font-size: 28px;
@@ -3621,6 +3664,7 @@ app.get('/o/:token', (req, res) => {
       color: #666;
       font-size: 16px;
       margin-bottom: 30px;
+      line-height: 1.5;
     }
     .app-button {
       display: inline-block;
@@ -3631,9 +3675,11 @@ app.get('/o/:token', (req, res) => {
       text-decoration: none;
       font-size: 18px;
       font-weight: 600;
-      margin: 20px 0;
+      margin: 10px 0;
       transition: transform 0.2s, box-shadow 0.2s;
       box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+      width: 100%;
+      max-width: 280px;
     }
     .app-button:hover {
       transform: translateY(-2px);
@@ -3642,61 +3688,302 @@ app.get('/o/:token', (req, res) => {
     .app-button:active {
       transform: translateY(0);
     }
+    .store-button {
+      display: inline-block;
+      background: #f5f5f5;
+      color: #333;
+      padding: 12px 24px;
+      border-radius: 12px;
+      text-decoration: none;
+      font-size: 16px;
+      font-weight: 500;
+      margin: 10px 0;
+      transition: background 0.2s;
+      width: 100%;
+      max-width: 280px;
+    }
+    .store-button:hover {
+      background: #e0e0e0;
+    }
     .info-text {
       color: #888;
       font-size: 14px;
-      margin-top: 30px;
+      margin-top: 20px;
       line-height: 1.6;
     }
-    .logo {
-      font-size: 48px;
-      margin-bottom: 20px;
+    .warning {
+      background: #fff3cd;
+      border-left: 4px solid #ffc107;
+      padding: 12px;
+      margin-top: 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #856404;
+      text-align: left;
+    }
+    .warning strong {
+      display: block;
+      margin-bottom: 4px;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="logo">🏥</div>
-    <h1>Ordonnance Medicalia</h1>
-    <p class="subtitle">Accédez à votre ordonnance</p>
-    <a href="${deepLink}" class="app-button">Ouvrir dans l'app</a>
-    <p class="info-text">
-      Si vous n'avez pas l'app Medicalia, installez-la depuis l'App Store ou Google Play.
-    </p>
+    <div class="logo">${icon}</div>
+    <h1>${title}</h1>
+    <p class="subtitle">${subtitle}</p>
+    <a href="${deepLink}" class="app-button" id="appButton">Ouvrir dans Medicalia</a>
+    ${hasStoreLink ? storeButtonHTML : ''}
+    <div class="warning">
+      <strong>⚠️ Sécurité</strong>
+      Ne donnez pas ce QR code à n'importe qui. Il contient des informations médicales confidentielles.
+    </div>
   </div>
   <script>
-    // Tentative d'ouverture automatique de l'app après 1 seconde
-    setTimeout(function() {
-      window.location.href = "${deepLink}";
-    }, 1000);
+    // Tentative d'ouverture automatique de l'app (une seule fois, sans boucle)
+    (function() {
+      var attempted = false;
+      var deepLink = "${deepLink}";
+      
+      // Tentative après 500ms
+      setTimeout(function() {
+        if (!attempted) {
+          attempted = true;
+          window.location.href = deepLink;
+          
+          // Si après 2s on est toujours sur la page, l'app n'est probablement pas installée
+          setTimeout(function() {
+            // Ne rien faire, laisser l'utilisateur cliquer manuellement
+          }, 2000);
+        }
+      }, 500);
+      
+      // Fallback: si l'utilisateur clique sur le bouton, on tente à nouveau
+      document.getElementById('appButton').addEventListener('click', function(e) {
+        if (!attempted) {
+          attempted = true;
+        }
+      });
+    })();
   </script>
 </body>
-</html>
-    `;
+</html>`;
+}
+
+// Helper: Générer le HTML d'erreur
+function generateErrorHTML(message) {
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+  <title>Erreur - Medicalia</title>
+  <style>
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+      text-align: center; 
+      padding: 40px 20px; 
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      background: white;
+      padding: 40px;
+      border-radius: 20px;
+      max-width: 400px;
+    }
+    h1 { color: #333; margin-bottom: 10px; }
+    p { color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Erreur</h1>
+    <p>${message}</p>
+  </div>
+</body>
+</html>`;
+}
+
+// Route GET /o/:token - Page web pour QR code ordonnance
+app.get('/o/:token', (req, res) => {
+  // Log léger: seulement le préfixe du token (premiers 8 caractères)
+  const token = req.params.token;
+  const tokenPrefix = token && token.length >= 8 ? token.substring(0, 8) + '...' : 'invalid';
+  console.log(`[QR_WEB] GET /o/:token appelée (token: ${tokenPrefix})`);
+  
+  // Headers de sécurité
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
+  });
+  
+  try {
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return res.status(400).send(generateErrorHTML('Token invalide'));
+    }
+    
+    // Détecter l'appareil
+    const userAgent = req.get('user-agent') || '';
+    const device = detectDevice(userAgent);
+    const storeLink = getStoreLink(device);
+    
+    // Deep link: medicalia://o/<token>
+    const deepLink = `medicalia://o/${token}`;
+    
+    // Générer le HTML
+    const html = generateQRPageHTML({
+      title: 'Ordonnance Medicalia',
+      subtitle: 'Accédez à votre ordonnance médicale en toute sécurité',
+      icon: '🏥',
+      deepLink,
+      storeLink,
+      device,
+      tokenPrefix
+    });
     
     res.status(200).send(html);
     
   } catch (error) {
-    console.error('[QR_WEB] ❌ Erreur:', error.message);
-    res.status(500).send(`
-      <!DOCTYPE html>
-      <html lang="fr">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Erreur - Medicalia</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 40px 20px; }
-          h1 { color: #333; }
-          p { color: #666; }
-        </style>
-      </head>
-      <body>
-        <h1>Erreur</h1>
-        <p>Une erreur est survenue lors du chargement de la page.</p>
-      </body>
-      </html>
-    `);
+    console.error('[QR_WEB] ❌ Erreur /o/:token:', error.message);
+    res.status(500).send(generateErrorHTML('Une erreur est survenue lors du chargement de la page.'));
+  }
+});
+
+// Route GET /p/:token - Page web pour QR code Passeport Santé
+app.get('/p/:token', (req, res) => {
+  // Log léger: seulement le préfixe du token (premiers 8 caractères)
+  const token = req.params.token;
+  const tokenPrefix = token && token.length >= 8 ? token.substring(0, 8) + '...' : 'invalid';
+  console.log(`[QR_WEB] GET /p/:token appelée (token: ${tokenPrefix})`);
+  
+  // Headers de sécurité
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
+  });
+  
+  try {
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return res.status(400).send(generateErrorHTML('Token invalide'));
+    }
+    
+    // Détecter l'appareil
+    const userAgent = req.get('user-agent') || '';
+    const device = detectDevice(userAgent);
+    const storeLink = getStoreLink(device);
+    
+    // Deep link: medicalia://p/<token>
+    const deepLink = `medicalia://p/${token}`;
+    
+    // Générer le HTML
+    const html = generateQRPageHTML({
+      title: 'Passeport Santé Medicalia',
+      subtitle: 'Accédez à votre résumé médical en toute sécurité',
+      icon: '📋',
+      deepLink,
+      storeLink,
+      device,
+      tokenPrefix
+    });
+    
+    res.status(200).send(html);
+    
+  } catch (error) {
+    console.error('[QR_WEB] ❌ Erreur /p/:token:', error.message);
+    res.status(500).send(generateErrorHTML('Une erreur est survenue lors du chargement de la page.'));
+  }
+});
+
+// Route GET /open/o/:token - Redirection directe vers deep link (sans JS)
+// But: Faciliter le bouton "Ouvrir" sans JavaScript
+// Comportement:
+// - Par défaut: redirige (302) vers medicalia://o/<token>
+// - Si ?fallback=1: redirige vers le store (App Store/Play Store) selon l'appareil
+// - Si deep link échoue: l'utilisateur reste sur la page d'origine ou est redirigé vers le store
+app.get('/open/o/:token', (req, res) => {
+  // Log léger: seulement le préfixe du token
+  const token = req.params.token;
+  const tokenPrefix = token && token.length >= 8 ? token.substring(0, 8) + '...' : 'invalid';
+  const fallback = req.query.fallback === '1';
+  console.log(`[QR_WEB] GET /open/o/:token appelée (token: ${tokenPrefix}, fallback: ${fallback})`);
+  
+  try {
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return res.status(400).send(generateErrorHTML('Token invalide'));
+    }
+    
+    // Si fallback=1, rediriger vers le store
+    if (fallback) {
+      const userAgent = req.get('user-agent') || '';
+      const device = detectDevice(userAgent);
+      const storeLink = getStoreLink(device);
+      
+      if (storeLink) {
+        return res.redirect(302, storeLink);
+      } else {
+        // Pas de store disponible (desktop), rediriger vers la page HTML
+        return res.redirect(302, `/o/${token}`);
+      }
+    }
+    
+    // Par défaut: rediriger vers le deep link
+    const deepLink = `medicalia://o/${token}`;
+    res.redirect(302, deepLink);
+    
+  } catch (error) {
+    console.error('[QR_WEB] ❌ Erreur /open/o/:token:', error.message);
+    // En cas d'erreur, rediriger vers la page HTML
+    res.redirect(302, `/o/${token}`);
+  }
+});
+
+// Route GET /open/p/:token - Redirection directe vers deep link (sans JS)
+// But: Faciliter le bouton "Ouvrir" sans JavaScript
+// Comportement:
+// - Par défaut: redirige (302) vers medicalia://p/<token>
+// - Si ?fallback=1: redirige vers le store (App Store/Play Store) selon l'appareil
+// - Si deep link échoue: l'utilisateur reste sur la page d'origine ou est redirigé vers le store
+app.get('/open/p/:token', (req, res) => {
+  // Log léger: seulement le préfixe du token
+  const token = req.params.token;
+  const tokenPrefix = token && token.length >= 8 ? token.substring(0, 8) + '...' : 'invalid';
+  const fallback = req.query.fallback === '1';
+  console.log(`[QR_WEB] GET /open/p/:token appelée (token: ${tokenPrefix}, fallback: ${fallback})`);
+  
+  try {
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return res.status(400).send(generateErrorHTML('Token invalide'));
+    }
+    
+    // Si fallback=1, rediriger vers le store
+    if (fallback) {
+      const userAgent = req.get('user-agent') || '';
+      const device = detectDevice(userAgent);
+      const storeLink = getStoreLink(device);
+      
+      if (storeLink) {
+        return res.redirect(302, storeLink);
+      } else {
+        // Pas de store disponible (desktop), rediriger vers la page HTML
+        return res.redirect(302, `/p/${token}`);
+      }
+    }
+    
+    // Par défaut: rediriger vers le deep link
+    const deepLink = `medicalia://p/${token}`;
+    res.redirect(302, deepLink);
+    
+  } catch (error) {
+    console.error('[QR_WEB] ❌ Erreur /open/p/:token:', error.message);
+    // En cas d'erreur, rediriger vers la page HTML
+    res.redirect(302, `/p/${token}`);
   }
 });
 
@@ -3889,89 +4176,335 @@ app.get('/api/passport/resolve', (req, res) => {
   }
 });
 
-// ===== DELIVERIES API (MVP) =====
-// Stockage temporaire des livraisons (en mémoire)
-const deliveriesStorage = new Map();
+// ===== DELIVERY ORDERS API =====
+// Stockage temporaire des commandes de livraison (en mémoire)
+// TODO: Migrer vers une base de données persistante (PostgreSQL/MongoDB)
+const deliveryOrdersStorage = new Map();
 
-// Validation du body pour créer une livraison
-function validateDeliveryBody(body) {
-  if (!body || typeof body !== 'object') return 'BODY_MISSING';
-  if (!body.ordonnanceId || typeof body.ordonnanceId !== 'string') return 'ORDONNANCE_ID_MISSING';
-  if (!body.pharmacy || typeof body.pharmacy !== 'object') return 'PHARMACY_MISSING';
-  if (!body.pharmacy.name || typeof body.pharmacy.name !== 'string') return 'PHARMACY_NAME_MISSING';
-  if (!body.deliveryAddress || typeof body.deliveryAddress !== 'object') return 'DELIVERY_ADDRESS_MISSING';
-  if (!body.deliveryAddress.line1 || typeof body.deliveryAddress.line1 !== 'string') return 'DELIVERY_ADDRESS_LINE1_MISSING';
-  if (!body.deliveryAddress.city || typeof body.deliveryAddress.city !== 'string') return 'DELIVERY_ADDRESS_CITY_MISSING';
-  if (!body.deliveryAddress.postalCode || typeof body.deliveryAddress.postalCode !== 'string') return 'DELIVERY_ADDRESS_POSTAL_CODE_MISSING';
-  if (!body.contact || typeof body.contact !== 'object') return 'CONTACT_MISSING';
-  if (!body.contact.name || typeof body.contact.name !== 'string') return 'CONTACT_NAME_MISSING';
-  if (!body.contact.phone || typeof body.contact.phone !== 'string') return 'CONTACT_PHONE_MISSING';
-  return null;
+// Statuts valides pour une commande de livraison
+const VALID_DELIVERY_STATUSES = ['PENDING', 'ACCEPTED', 'PICKED_UP'];
+
+// Validation du body pour créer une commande de livraison
+function validateCreateDeliveryOrderBody(body) {
+  if (!body || typeof body !== 'object') {
+    return { valid: false, error: 'BODY_MISSING', message: 'Le body de la requête est manquant' };
+  }
+  
+  if (!body.ordonnanceId || typeof body.ordonnanceId !== 'string' || body.ordonnanceId.trim() === '') {
+    return { valid: false, error: 'ORDONNANCE_ID_MISSING', message: 'ordonnanceId est requis et doit être une chaîne non vide' };
+  }
+  
+  if (!body.pharmacyId || typeof body.pharmacyId !== 'string' || body.pharmacyId.trim() === '') {
+    return { valid: false, error: 'PHARMACY_ID_MISSING', message: 'pharmacyId est requis et doit être une chaîne non vide' };
+  }
+  
+  if (!body.deliveryAddress || typeof body.deliveryAddress !== 'string' || body.deliveryAddress.trim() === '') {
+    return { valid: false, error: 'DELIVERY_ADDRESS_MISSING', message: 'deliveryAddress est requis et doit être une chaîne non vide' };
+  }
+  
+  // Champs optionnels
+  if (body.deliveryNote !== undefined && typeof body.deliveryNote !== 'string') {
+    return { valid: false, error: 'INVALID_DELIVERY_NOTE', message: 'deliveryNote doit être une chaîne ou null' };
+  }
+  
+  if (body.patientPhone !== undefined && typeof body.patientPhone !== 'string') {
+    return { valid: false, error: 'INVALID_PATIENT_PHONE', message: 'patientPhone doit être une chaîne ou null' };
+  }
+  
+  if (body.timeWindow !== undefined && typeof body.timeWindow !== 'string') {
+    return { valid: false, error: 'INVALID_TIME_WINDOW', message: 'timeWindow doit être une chaîne ou null' };
+  }
+  
+  return { valid: true };
 }
 
-// Route POST /api/deliveries/create - Créer une demande de livraison
-app.post('/api/deliveries/create', (req, res) => {
-  console.log('[DELIVERIES] POST /api/deliveries/create appelée');
+// Validation du body pour mettre à jour le statut
+function validateUpdateStatusBody(body) {
+  if (!body || typeof body !== 'object') {
+    return { valid: false, error: 'BODY_MISSING', message: 'Le body de la requête est manquant' };
+  }
+  
+  if (!body.status || typeof body.status !== 'string') {
+    return { valid: false, error: 'STATUS_MISSING', message: 'status est requis et doit être une chaîne' };
+  }
+  
+  if (!VALID_DELIVERY_STATUSES.includes(body.status)) {
+    return { 
+      valid: false, 
+      error: 'INVALID_STATUS', 
+      message: `status doit être l'un des suivants: ${VALID_DELIVERY_STATUSES.join(', ')}` 
+    };
+  }
+  
+  return { valid: true };
+}
+
+// Fonction pour créer un objet DeliveryOrder
+function createDeliveryOrder(data) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // +24h
+  
+  return {
+    id: randomUUID(),
+    ordonnanceId: data.ordonnanceId,
+    pharmacyId: data.pharmacyId,
+    status: 'PENDING',
+    deliveryAddress: data.deliveryAddress,
+    deliveryNote: data.deliveryNote || null,
+    patientPhone: data.patientPhone || null,
+    timeWindow: data.timeWindow || null,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    expiresAt: expiresAt.toISOString()
+  };
+}
+
+// Fonction pour nettoyer les données sensibles avant de renvoyer une commande
+// SÉCURITÉ: Ne jamais exposer le contenu de l'ordonnance ni le QR
+function sanitizeDeliveryOrder(order) {
+  if (!order) return null;
+  
+  return {
+    id: order.id,
+    ordonnanceId: order.ordonnanceId,
+    pharmacyId: order.pharmacyId,
+    status: order.status,
+    deliveryAddress: order.deliveryAddress,
+    deliveryNote: order.deliveryNote,
+    patientPhone: order.patientPhone,
+    timeWindow: order.timeWindow,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    expiresAt: order.expiresAt
+    // NOTE: Pas de contenu ordonnance, pas de QR, pas de données médicales
+  };
+}
+
+// Placeholder pour notifier la pharmacie
+function notifyPharmacy(order) {
+  console.log('[DELIVERY] 📧 Notifier pharmacie:', {
+    orderId: order.id,
+    pharmacyId: order.pharmacyId,
+    status: order.status,
+    // TODO: Implémenter notification Twilio/FCM/SMS
+  });
+}
+
+// Placeholder pour notifier le pool de livreurs
+function notifyCourierPool(order) {
+  console.log('[DELIVERY] 🚚 Notifier pool de livreurs:', {
+    orderId: order.id,
+    pharmacyId: order.pharmacyId,
+    deliveryAddress: order.deliveryAddress,
+    status: order.status,
+    // TODO: Implémenter notification FCM/Push pour livreurs
+  });
+}
+
+// Route POST /delivery/orders - Créer une commande de livraison
+app.post('/delivery/orders', (req, res) => {
+  console.log('[DELIVERY] POST /delivery/orders appelée');
   
   try {
     // Validation
-    const err = validateDeliveryBody(req.body);
-    if (err) {
+    const validation = validateCreateDeliveryOrderBody(req.body);
+    if (!validation.valid) {
       return res.status(400).json({
         ok: false,
-        error: 'INVALID_BODY',
-        detail: err
+        error: validation.error,
+        message: validation.message
       });
     }
 
-    // Générer un ID unique pour la livraison
-    const deliveryId = `delivery_${randomUUID()}`;
-    
-    // Créer l'objet livraison
-    const delivery = {
-      deliveryId,
-      ordonnanceId: req.body.ordonnanceId,
-      pharmacy: {
-        name: req.body.pharmacy.name,
-        address: req.body.pharmacy.address || null,
-        lat: req.body.pharmacy.lat || null,
-        lng: req.body.pharmacy.lng || null
-      },
-      deliveryAddress: {
-        line1: req.body.deliveryAddress.line1,
-        city: req.body.deliveryAddress.city,
-        postalCode: req.body.deliveryAddress.postalCode
-      },
-      contact: {
-        name: req.body.contact.name,
-        phone: req.body.contact.phone
-      },
-      status: 'CREATED',
-      createdAt: new Date().toISOString()
-    };
+    // Créer la commande
+    const order = createDeliveryOrder({
+      ordonnanceId: req.body.ordonnanceId.trim(),
+      pharmacyId: req.body.pharmacyId.trim(),
+      deliveryAddress: req.body.deliveryAddress.trim(),
+      deliveryNote: req.body.deliveryNote?.trim() || null,
+      patientPhone: req.body.patientPhone?.trim() || null,
+      timeWindow: req.body.timeWindow?.trim() || null
+    });
 
     // Stocker en mémoire
-    deliveriesStorage.set(deliveryId, delivery);
+    deliveryOrdersStorage.set(order.id, order);
     
-    console.log(`[DELIVERIES] ✅ Livraison créée: ${deliveryId} (total: ${deliveriesStorage.size})`);
+    console.log(`[DELIVERY] ✅ Commande créée: ${order.id} (total: ${deliveryOrdersStorage.size})`);
 
-    // Retourner la réponse
+    // Notifier la pharmacie (placeholder)
+    notifyPharmacy(order);
+
+    // Retourner la réponse (sans données sensibles)
     return res.status(200).json({
       ok: true,
-      deliveryId,
-      status: 'CREATED'
+      order: sanitizeDeliveryOrder(order)
     });
 
   } catch (error) {
-    console.error('[DELIVERIES] ❌ Erreur:', error.message);
+    console.error('[DELIVERY] ❌ Erreur:', error.message);
     if (error.stack) {
-      console.error('[DELIVERIES] Stack:', error.stack);
+      console.error('[DELIVERY] Stack:', error.stack);
     }
     
     return res.status(500).json({
       ok: false,
-      error: 'DELIVERY_CREATION_FAILED',
-      message: 'Erreur lors de la création de la demande de livraison'
+      error: 'DELIVERY_ORDER_CREATION_FAILED',
+      message: 'Erreur lors de la création de la commande de livraison'
+    });
+  }
+});
+
+// Route GET /delivery/orders/:id - Lire une commande
+app.get('/delivery/orders/:id', (req, res) => {
+  console.log('[DELIVERY] GET /delivery/orders/:id appelée');
+  
+  try {
+    const orderId = req.params.id;
+    
+    if (!orderId || typeof orderId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_ORDER_ID',
+        message: 'ID de commande invalide'
+      });
+    }
+
+    const order = deliveryOrdersStorage.get(orderId);
+    
+    if (!order) {
+      return res.status(404).json({
+        ok: false,
+        error: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      });
+    }
+
+    // Retourner la commande (sans données sensibles)
+    return res.status(200).json({
+      ok: true,
+      order: sanitizeDeliveryOrder(order)
+    });
+
+  } catch (error) {
+    console.error('[DELIVERY] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[DELIVERY] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'DELIVERY_ORDER_FETCH_FAILED',
+      message: 'Erreur lors de la récupération de la commande'
+    });
+  }
+});
+
+// Route GET /delivery/orders?ordonnanceId=... - Lister les commandes d'une ordonnance
+app.get('/delivery/orders', (req, res) => {
+  console.log('[DELIVERY] GET /delivery/orders appelée');
+  
+  try {
+    const ordonnanceId = req.query.ordonnanceId;
+    
+    if (!ordonnanceId || typeof ordonnanceId !== 'string' || ordonnanceId.trim() === '') {
+      return res.status(400).json({
+        ok: false,
+        error: 'ORDONNANCE_ID_MISSING',
+        message: 'Le paramètre ordonnanceId est requis'
+      });
+    }
+
+    // Filtrer les commandes par ordonnanceId
+    const orders = Array.from(deliveryOrdersStorage.values())
+      .filter(order => order.ordonnanceId === ordonnanceId.trim())
+      .map(order => sanitizeDeliveryOrder(order));
+
+    return res.status(200).json({
+      ok: true,
+      orders,
+      count: orders.length
+    });
+
+  } catch (error) {
+    console.error('[DELIVERY] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[DELIVERY] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'DELIVERY_ORDERS_FETCH_FAILED',
+      message: 'Erreur lors de la récupération des commandes'
+    });
+  }
+});
+
+// Route PATCH /delivery/orders/:id/status - Mettre à jour le statut (pour tests/admin)
+app.patch('/delivery/orders/:id/status', (req, res) => {
+  console.log('[DELIVERY] PATCH /delivery/orders/:id/status appelée');
+  
+  try {
+    const orderId = req.params.id;
+    
+    if (!orderId || typeof orderId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_ORDER_ID',
+        message: 'ID de commande invalide'
+      });
+    }
+
+    // Validation du body
+    const validation = validateUpdateStatusBody(req.body);
+    if (!validation.valid) {
+      return res.status(400).json({
+        ok: false,
+        error: validation.error,
+        message: validation.message
+      });
+    }
+
+    const order = deliveryOrdersStorage.get(orderId);
+    
+    if (!order) {
+      return res.status(404).json({
+        ok: false,
+        error: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      });
+    }
+
+    // Mettre à jour le statut
+    const oldStatus = order.status;
+    order.status = req.body.status;
+    order.updatedAt = new Date().toISOString();
+    
+    // Mettre à jour le stockage
+    deliveryOrdersStorage.set(orderId, order);
+    
+    console.log(`[DELIVERY] ✅ Statut mis à jour: ${orderId} ${oldStatus} → ${order.status}`);
+
+    // Notifier selon le nouveau statut
+    if (order.status === 'ACCEPTED') {
+      notifyCourierPool(order);
+    }
+
+    // Retourner la commande mise à jour (sans données sensibles)
+    return res.status(200).json({
+      ok: true,
+      order: sanitizeDeliveryOrder(order)
+    });
+
+  } catch (error) {
+    console.error('[DELIVERY] ❌ Erreur:', error.message);
+    if (error.stack) {
+      console.error('[DELIVERY] Stack:', error.stack);
+    }
+    
+    return res.status(500).json({
+      ok: false,
+      error: 'DELIVERY_ORDER_UPDATE_FAILED',
+      message: 'Erreur lors de la mise à jour du statut de la commande'
     });
   }
 });
@@ -3987,6 +4520,7 @@ app.use((req, res) => {
     'GET /version',
     'GET /beacon',
     'GET /healthz',
+    'GET /billing/plan',
       'POST /extract',
     'GET /ai/medical-summary/health',
     'GET /ai/medical_summary/health',
@@ -4008,9 +4542,15 @@ app.use((req, res) => {
       'GET /api/ordonnances/:id/qr',
       'GET /api/qr/resolve',
       'GET /o/:token',
+      'GET /p/:token',
+      'GET /open/o/:token',
+      'GET /open/p/:token',
       'GET /api/passport/qr',
       'GET /api/passport/resolve',
-      'POST /api/deliveries/create'
+      'POST /delivery/orders',
+      'GET /delivery/orders/:id',
+      'GET /delivery/orders?ordonnanceId=...',
+      'PATCH /delivery/orders/:id/status'
   ];
   
   res.status(404).json({ 
