@@ -3394,20 +3394,17 @@ async function aiSummaryV2Handler(req, res) {
       console.log(`[AI_SUMMARY_V2] healthProfile reçu (hash: ${healthProfileHash})`);
     }
     
-    // Construire factsText pour OpenAI
+    // IMPORTANT: Si un cache est implémenté, la clé doit inclure healthProfile pour éviter un mauvais cache
+    // Exemple de cacheKey: userId + ":" + hash(ordonnances) + ":" + (healthProfile.updatedAt || hash(healthProfile))
+    // Cela garantit que le résumé se régénère si le HealthProfile change
+    // const cacheKey = `${userId}:${hashOrdonnances}:${healthProfile?.updatedAt || hashHealthProfile}`;
+    
+    // Construire factsText pour OpenAI (SANS identité)
     const factsParts = [];
     
-    // Identité
-    const nomParts = [];
-    if (personal.nom) nomParts.push(personal.nom.toUpperCase());
-    if (personal.prenom) nomParts.push(personal.prenom);
-    if (nomParts.length > 0) {
-      factsParts.push(`Identité: ${nomParts.join(' ')}`);
-    }
-    
-    // Allergies
+    // Allergies (depuis personal, pas depuis healthProfile - ce sont des sources différentes)
     if (Array.isArray(personal.allergies) && personal.allergies.length > 0) {
-      factsParts.push(`Allergies: ${personal.allergies.join(', ')}`);
+      factsParts.push(`Allergies (ordonnances): ${personal.allergies.join(', ')}`);
     }
     
     // Médicaments
@@ -3466,58 +3463,120 @@ async function aiSummaryV2Handler(req, res) {
       factsParts.push(...actionLines);
     }
     
-    // Ajouter le contexte patient (healthProfile) si présent
+    // Ajouter TOUT le contexte HealthProfile (déclaratif) si présent
     if (healthProfile && typeof healthProfile === 'object') {
-      factsParts.push('\n=== CONTEXTE PATIENT (DÉCLARÉ PAR L\'UTILISATEUR) ===');
+      factsParts.push('\n=== CONTEXTE DÉCLARÉ PAR L\'UTILISATEUR (HEALTHPROFILE) ===');
+      factsParts.push('IMPORTANT: Ces informations sont déclaratives, ne pas inférer. Utiliser uniquement ce qui est présent.');
       
-      // Allergies déclarées
+      // Allergies
       if (healthProfile.allergies && Array.isArray(healthProfile.allergies) && healthProfile.allergies.length > 0) {
-        factsParts.push(`Allergies déclarées: ${healthProfile.allergies.join(', ')}`);
+        factsParts.push(`Allergies: ${healthProfile.allergies.join(', ')}`);
       }
       
-      // Maladies chroniques
-      if (healthProfile.chronicDiseases && Array.isArray(healthProfile.chronicDiseases) && healthProfile.chronicDiseases.length > 0) {
-        factsParts.push(`Maladies chroniques déclarées: ${healthProfile.chronicDiseases.join(', ')}`);
+      // Maladies chroniques (chronicConditions ou chronicDiseases)
+      const chronicConditions = healthProfile.chronicConditions || healthProfile.chronicDiseases;
+      if (Array.isArray(chronicConditions) && chronicConditions.length > 0) {
+        factsParts.push(`Maladies chroniques: ${chronicConditions.join(', ')}`);
       }
       
-      // Traitements au long cours
-      if (healthProfile.longTermTreatments && Array.isArray(healthProfile.longTermTreatments) && healthProfile.longTermTreatments.length > 0) {
-        const treatments = healthProfile.longTermTreatments.map(t => {
+      // Traitements (treatments ou longTermTreatments)
+      const treatments = healthProfile.treatments || healthProfile.longTermTreatments;
+      if (Array.isArray(treatments) && treatments.length > 0) {
+        const treatmentLines = treatments.map(t => {
           if (typeof t === 'string') return t;
-          if (typeof t === 'object' && t.name) return t.name + (t.dosage ? ` (${t.dosage})` : '');
+          if (typeof t === 'object') {
+            const parts = [];
+            if (t.name) parts.push(t.name);
+            if (t.dosage) parts.push(`(${t.dosage})`);
+            if (t.frequency) parts.push(`- ${t.frequency}`);
+            return parts.join(' ');
+          }
           return '';
         }).filter(Boolean);
-        if (treatments.length > 0) {
-          factsParts.push(`Traitements au long cours déclarés: ${treatments.join(', ')}`);
+        if (treatmentLines.length > 0) {
+          factsParts.push(`Traitements en cours: ${treatmentLines.join(' ; ')}`);
         }
       }
       
-      // Contact d'urgence
+      // Chirurgies (surgeries)
+      if (healthProfile.surgeries && Array.isArray(healthProfile.surgeries) && healthProfile.surgeries.length > 0) {
+        const surgeryLines = healthProfile.surgeries.map(s => {
+          if (typeof s === 'string') return s;
+          if (typeof s === 'object') {
+            const parts = [];
+            if (s.name) parts.push(s.name);
+            if (s.date) parts.push(`(${s.date})`);
+            return parts.join(' ');
+          }
+          return '';
+        }).filter(Boolean);
+        if (surgeryLines.length > 0) {
+          factsParts.push(`Chirurgies: ${surgeryLines.join(' ; ')}`);
+        }
+      }
+      
+      // Contacts médecins (doctorContacts)
+      if (healthProfile.doctorContacts && Array.isArray(healthProfile.doctorContacts) && healthProfile.doctorContacts.length > 0) {
+        const doctorLines = healthProfile.doctorContacts.map(doc => {
+          if (typeof doc === 'string') return doc;
+          if (typeof doc === 'object') {
+            const parts = [];
+            if (doc.name) parts.push(doc.name);
+            if (doc.specialty) parts.push(`(${doc.specialty})`);
+            if (doc.phone) parts.push(`- ${doc.phone}`);
+            return parts.join(' ');
+          }
+          return '';
+        }).filter(Boolean);
+        if (doctorLines.length > 0) {
+          factsParts.push(`Contacts médecins: ${doctorLines.join(' ; ')}`);
+        }
+      }
+      
+      // Contact d'urgence (emergencyContact)
       if (healthProfile.emergencyContact) {
         const contact = healthProfile.emergencyContact;
         const contactParts = [];
-        if (contact.name) contactParts.push(`Nom: ${contact.name}`);
-        if (contact.phone) contactParts.push(`Téléphone: ${contact.phone}`);
-        if (contact.relationship) contactParts.push(`Relation: ${contact.relationship}`);
+        if (contact.name) contactParts.push(contact.name);
+        if (contact.phone) contactParts.push(contact.phone);
+        if (contact.relationship) contactParts.push(`(${contact.relationship})`);
         if (contactParts.length > 0) {
-          factsParts.push(`Contact d'urgence déclaré: ${contactParts.join(', ')}`);
+          factsParts.push(`Contact d'urgence: ${contactParts.join(' ')}`);
         }
       }
       
-      // Autres informations déclaratives
-      if (healthProfile.otherInfo && typeof healthProfile.otherInfo === 'string' && healthProfile.otherInfo.trim()) {
-        factsParts.push(`Autres informations déclarées: ${healthProfile.otherInfo.trim()}`);
+      // Notes (notes ou otherInfo)
+      const notes = healthProfile.notes || healthProfile.otherInfo;
+      if (notes) {
+        if (typeof notes === 'string' && notes.trim()) {
+          factsParts.push(`Notes: ${notes.trim()}`);
+        } else if (Array.isArray(notes) && notes.length > 0) {
+          factsParts.push(`Notes: ${notes.join(' ; ')}`);
+        }
       }
+      
+      // Tous les autres champs du HealthProfile (pour ne rien oublier)
+      Object.keys(healthProfile).forEach(key => {
+        if (!['allergies', 'chronicConditions', 'chronicDiseases', 'treatments', 'longTermTreatments', 
+              'surgeries', 'doctorContacts', 'emergencyContact', 'notes', 'otherInfo', 'updatedAt'].includes(key)) {
+          const value = healthProfile[key];
+          if (value !== null && value !== undefined && value !== '') {
+            if (Array.isArray(value) && value.length > 0) {
+              factsParts.push(`${key}: ${value.join(', ')}`);
+            } else if (typeof value === 'object' && Object.keys(value).length > 0) {
+              factsParts.push(`${key}: ${JSON.stringify(value)}`);
+            } else if (typeof value === 'string' && value.trim()) {
+              factsParts.push(`${key}: ${value.trim()}`);
+            }
+          }
+        }
+      });
     }
     
     const factsText = factsParts.join('\n');
     
-    // Générer le résumé fallback (toujours disponible)
+    // Générer le résumé fallback (toujours disponible) - SANS identité
     const fallbackParts = [];
-    const nom = [personal.prenom, personal.nom].filter(Boolean).join(' ').trim();
-    if (nom) {
-      fallbackParts.push(nom.toUpperCase());
-    }
     
     const medicaments = [];
     ordonnances.forEach(ord => {
@@ -3579,11 +3638,22 @@ async function aiSummaryV2Handler(req, res) {
       try {
         const client = new OpenAI({ apiKey: OPENAI_KEY });
         
-        // Construire le prompt système avec indication sur healthProfile
-        let systemPrompt = `Tu fais une synthèse factuelle. Aucun diagnostic, aucun conseil médical, aucune interprétation clinique. N'invente rien. Structure la réponse en 3 à 6 puces, courtes.`;
+        // Construire le prompt système avec instructions strictes
+        let systemPrompt = `Tu fais une synthèse factuelle médicale. Aucun diagnostic, aucun conseil médical, aucune interprétation clinique. N'invente rien.
+
+RÈGLES STRICTES:
+- Ne JAMAIS inclure de section "Identité", "Patient", "Nom", "Prénom", "Date de naissance" dans le résumé.
+- Ne JAMAIS afficher de données nominatives (nom, prénom, âge).
+- Structure la réponse en sections recommandées:
+  * "Antécédents & allergies"
+  * "Traitements en cours"
+  * "Rendez-vous & examens"
+  * "Points d'attention"
+- Utilise uniquement les informations présentes dans le contexte fourni.
+- Si une information n'est pas dans le contexte, ne l'invente pas.`;
         
         if (healthProfile) {
-          systemPrompt += `\n\nIMPORTANT: La section "CONTEXTE PATIENT (DÉCLARÉ PAR L'UTILISATEUR)" contient des informations déclaratives fournies par l'utilisateur. Ne les invente pas, utilise-les uniquement si elles sont présentes dans cette section.`;
+          systemPrompt += `\n\nIMPORTANT: La section "CONTEXTE DÉCLARÉ PAR L'UTILISATEUR (HEALTHPROFILE)" contient des informations déclaratives fournies par l'utilisateur. Ce sont des informations déclaratives, ne pas inférer. Utilise-les uniquement si elles sont présentes dans cette section.`;
         }
         
         const completion = await Promise.race([
@@ -3619,25 +3689,46 @@ async function aiSummaryV2Handler(req, res) {
       source = 'fallback';
     }
     
-    // Inclure healthProfile dans le fallback si présent
+    // Inclure TOUT le healthProfile dans le fallback si présent (SANS identité)
     if (source === 'fallback' && healthProfile) {
       const healthParts = [];
+      
+      // Allergies
       if (healthProfile.allergies && Array.isArray(healthProfile.allergies) && healthProfile.allergies.length > 0) {
         healthParts.push(`Allergies: ${healthProfile.allergies.join(', ')}`);
       }
-      if (healthProfile.chronicDiseases && Array.isArray(healthProfile.chronicDiseases) && healthProfile.chronicDiseases.length > 0) {
-        healthParts.push(`Maladies chroniques: ${healthProfile.chronicDiseases.join(', ')}`);
+      
+      // Maladies chroniques (chronicConditions ou chronicDiseases)
+      const chronicConditions = healthProfile.chronicConditions || healthProfile.chronicDiseases;
+      if (Array.isArray(chronicConditions) && chronicConditions.length > 0) {
+        healthParts.push(`Maladies chroniques: ${chronicConditions.join(', ')}`);
       }
-      if (healthProfile.longTermTreatments && Array.isArray(healthProfile.longTermTreatments) && healthProfile.longTermTreatments.length > 0) {
-        const treatments = healthProfile.longTermTreatments.map(t => {
+      
+      // Traitements (treatments ou longTermTreatments)
+      const treatments = healthProfile.treatments || healthProfile.longTermTreatments;
+      if (Array.isArray(treatments) && treatments.length > 0) {
+        const treatmentNames = treatments.map(t => {
           if (typeof t === 'string') return t;
           if (typeof t === 'object' && t.name) return t.name;
           return '';
         }).filter(Boolean);
-        if (treatments.length > 0) {
-          healthParts.push(`Traitements au long cours: ${treatments.join(', ')}`);
+        if (treatmentNames.length > 0) {
+          healthParts.push(`Traitements: ${treatmentNames.join(', ')}`);
         }
       }
+      
+      // Chirurgies
+      if (healthProfile.surgeries && Array.isArray(healthProfile.surgeries) && healthProfile.surgeries.length > 0) {
+        const surgeryNames = healthProfile.surgeries.map(s => {
+          if (typeof s === 'string') return s;
+          if (typeof s === 'object' && s.name) return s.name;
+          return '';
+        }).filter(Boolean);
+        if (surgeryNames.length > 0) {
+          healthParts.push(`Chirurgies: ${surgeryNames.join(', ')}`);
+        }
+      }
+      
       if (healthParts.length > 0) {
         summary += (summary ? ' | ' : '') + healthParts.join(' | ');
       }
@@ -3806,16 +3897,45 @@ function generateFallbackSummary(personal, ordonnances) {
 // ===== QR CODE API (Token signé pour ordonnances) =====
 // Fonction générique pour créer un token signé
 function createSignedToken(payload, secret) {
+  // VALIDATION: payload et secret doivent être valides
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Payload invalide: doit être un objet');
+  }
+  
+  if (!secret || typeof secret !== 'string' || secret.trim().length === 0) {
+    throw new Error('Secret invalide: doit être une chaîne non vide');
+  }
+  
   // Encoder le payload en base64url
-  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  let payloadBase64;
+  try {
+    payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  } catch (error) {
+    throw new Error(`Erreur lors de l'encodage du payload: ${error.message}`);
+  }
+  
+  if (!payloadBase64 || payloadBase64.length === 0) {
+    throw new Error('Payload encodé est vide');
+  }
   
   // Générer la signature HMAC
   const hmac = createHmac('sha256', secret);
   hmac.update(payloadBase64);
   const signature = hmac.digest('base64url');
   
+  if (!signature || signature.length === 0) {
+    throw new Error('Signature générée est vide');
+  }
+  
   // Token = payload.signature
-  return `${payloadBase64}.${signature}`;
+  const token = `${payloadBase64}.${signature}`;
+  
+  // VALIDATION: Le token final ne doit jamais être vide
+  if (!token || token.length === 0) {
+    throw new Error('Token généré est vide');
+  }
+  
+  return token;
 }
 
 // Fonction générique pour vérifier un token signé
@@ -4410,20 +4530,15 @@ app.get('/api/passport/qr', (req, res) => {
   console.log('[PASSPORT_QR] GET /api/passport/qr appelée');
   
   try {
-    // Récupérer le secret (PASSPORT_QR_SECRET ou fallback QR_SECRET)
+    // VALIDATION STRICTE: PASSPORT_QR_SECRET est REQUIS
     const PASSPORT_SECRET = process.env.PASSPORT_QR_SECRET || process.env.QR_SECRET;
     
-    // Si secret absent, utiliser un mode unsigned (fallback)
-    if (!PASSPORT_SECRET) {
-      console.warn('[PASSPORT_QR] secret missing -> fallback unsigned');
-      return res.status(200).json({
-        ok: true,
-        qrPayload: 'medicalia://passport?mode=unsigned',
-        deepLink: 'medicalia://passport?mode=unsigned',
-        webUrl: 'https://medicalia.app/p/unsigned',
-        expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
-        warning: 'PASSPORT_SECRET_MISSING',
-        serverBuild: 'PASSPORT_QR_FALLBACK'
+    if (!PASSPORT_SECRET || typeof PASSPORT_SECRET !== 'string' || PASSPORT_SECRET.trim().length === 0) {
+      console.error('[PASSPORT_QR] ❌ PASSPORT_SECRET manquant ou invalide');
+      return res.status(500).json({
+        ok: false,
+        error: 'PASSPORT_SECRET_MISSING',
+        message: 'PASSPORT_QR_SECRET ou QR_SECRET est requis pour générer un token valide'
       });
     }
     
@@ -4530,21 +4645,56 @@ app.get('/api/passport/qr', (req, res) => {
       exp: expiresAt
     };
     
+    // VALIDATION: Vérifier que le payload est valide
+    if (!payload || typeof payload !== 'object') {
+      console.error('[PASSPORT_QR] ❌ Payload invalide');
+      return res.status(500).json({
+        ok: false,
+        error: 'PASSPORT_TOKEN_GENERATION_FAILED',
+        message: 'Payload invalide pour la génération du token'
+      });
+    }
+    
     // Générer le token signé
-    const token = createSignedToken(payload, PASSPORT_SECRET);
+    let token;
+    try {
+      token = createSignedToken(payload, PASSPORT_SECRET);
+    } catch (tokenError) {
+      console.error('[PASSPORT_QR] ❌ Erreur lors de la génération du token:', tokenError.message);
+      return res.status(500).json({
+        ok: false,
+        error: 'PASSPORT_TOKEN_GENERATION_FAILED',
+        message: 'Erreur lors de la génération du token signé'
+      });
+    }
+    
+    // VALIDATION STRICTE: Le token ne doit JAMAIS être null ou vide
+    if (!token || typeof token !== 'string' || token.trim().length === 0) {
+      console.error('[PASSPORT_QR] ❌ Token généré est null ou vide');
+      return res.status(500).json({
+        ok: false,
+        error: 'PASSPORT_TOKEN_GENERATION_FAILED',
+        message: 'Le token généré est invalide (null ou vide)'
+      });
+    }
     
     // Construire le deep link et l'URL web
     const deepLink = `medicalia://passport?t=${token}`;
     const webUrl = `https://medicalia.app/p/${token}`;
     
-    console.log(`[PASSPORT_QR] issued exp=${new Date(expiresAt).toISOString()}`);
+    // Logs DEV utiles (sans exposer le token complet)
+    const tokenPrefix = token.length >= 8 ? token.substring(0, 8) + '...' : 'invalid';
+    const payloadKeys = Object.keys(payload).join(',');
+    console.log(`[PASSPORT_QR] ✅ Token généré avec succès (prefix: ${tokenPrefix}, expiresAt: ${new Date(expiresAt).toISOString()}, payload keys: ${payloadKeys})`);
     
+    // Normaliser la réponse: toujours inclure token (format unique)
     return res.status(200).json({
       ok: true,
-      qrPayload: deepLink, // Garder pour compatibilité
-      deepLink,
-      webUrl,
+      token: token, // TOUJOURS présent, jamais null
       expiresAt: new Date(expiresAt).toISOString(),
+      deepLink: deepLink,
+      webUrl: webUrl,
+      qrPayload: deepLink, // Compatibilité (déprécié, utiliser token)
       serverBuild: 'AI_SUMMARY_V2'
     });
     
