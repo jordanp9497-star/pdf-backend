@@ -218,7 +218,8 @@ function createOrdonnance(data) {
     doctorName: data.doctorName || null,
     patientName: data.patientName || null,
     medications: data.medications || [],
-    appointments: data.appointments || [], // Appointments structurés
+    appointments: data.appointments || [], // Compatibilité (tableau)
+    rdv: data.rdv || null, // Nouveau format (objet unique)
     status: data.status || 'a_recuperer',
     createdAt: data.createdAt || new Date().toISOString(),
     type: data.type || null // Type d'ordonnance (MEDICAMENT ou RENDEZ_VOUS)
@@ -230,7 +231,7 @@ function createOrdonnance(data) {
   console.log('[ORD STORE] ID:', ordonnance.id);
   console.log('[ORD STORE] Source:', ordonnance.source);
   console.log('[ORD STORE] Type:', ordonnance.type || 'non spécifié');
-  console.log('[ORD STORE] Appointments:', ordonnance.appointments?.length || 0);
+  console.log('[ORD STORE] RDV:', ordonnance.rdv ? `${ordonnance.rdv.appointmentTitle} - ${ordonnance.rdv.doctorName || 'N/A'}` : 'Aucun');
   console.log('[ORD STORE] Total ordonnances:', ordonnances.length);
 
   return ordonnance;
@@ -1355,74 +1356,211 @@ function normalizeOrdonnance(structured, rawText = '') {
                                  structured?.observations || 
                                  '';
 
-  // Normaliser les rendez-vous avec les nouveaux champs structurés
-  let appointments = [];
-  if (Array.isArray(structured?.appointments)) {
-    appointments = structured.appointments.map(apt => {
-      // Si c'est déjà un objet structuré, normaliser
-      if (typeof apt === 'object' && apt !== null) {
-        // Parser datetimeISO si présent
-        let datetimeISO = apt.datetimeISO || apt.datetime || apt.date || '';
-        
-        // Si datetimeISO est une date simple (sans heure), essayer de la convertir
-        if (datetimeISO && !datetimeISO.includes('T') && !datetimeISO.includes('Z')) {
-          // Formats de date courants: DD/MM/YYYY, DD-MM-YYYY, etc.
-          const dateMatch = datetimeISO.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
-          if (dateMatch) {
-            const [, day, month, year] = dateMatch;
-            // Créer une date ISO avec heure par défaut (midi) si pas d'heure spécifiée
-            datetimeISO = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T12:00:00+01:00`;
-          }
-        }
-        
-        // Extraire l'heure si présente dans le texte mais pas dans datetimeISO
-        const timeMatch = apt.time || apt.heure || '';
-        if (timeMatch && datetimeISO && !datetimeISO.includes('T')) {
-          // Essayer d'ajouter l'heure à la date
-          const timeParts = timeMatch.match(/(\d{1,2})[:h](\d{2})/);
-          if (timeParts) {
-            const [, hours, minutes] = timeParts;
-            const datePart = datetimeISO.split('T')[0];
-            datetimeISO = `${datePart}T${hours.padStart(2, '0')}:${minutes}:00+01:00`;
-          }
-        }
-        
-        // Fallback: appointmentTitle default si absent
-        const appointmentTitle = apt.appointmentTitle || apt.title || apt.motif || 'Rendez-vous médical';
-        
-        // Fallback: utiliser le nom du docteur prescripteur si absent
-        const doctorName = apt.doctorName || apt.doctor || apt.medecin || '';
-        
-        return {
-          appointmentTitle: appointmentTitle,
-          doctorName: doctorName,
-          datetimeISO: datetimeISO, // REQUIS pour créer un événement calendrier
-          location: apt.location || apt.lieu || apt.adresse || apt.address || ''
-        };
-      }
-      // Si c'est une string (ancien format), essayer de parser
-      if (typeof apt === 'string') {
-        // Parser basique pour les strings
-        const dateMatch = apt.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
-        const timeMatch = apt.match(/(\d{1,2})[:h](\d{2})/);
-        
-        let datetimeISO = '';
-        if (dateMatch) {
-          const [, day, month, year] = dateMatch;
-          const hours = timeMatch ? timeMatch[1] : '12';
-          const minutes = timeMatch ? timeMatch[2] : '00';
-          datetimeISO = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hours.padStart(2, '0')}:${minutes}:00+01:00`;
-        }
-        
-        return {
-          appointmentTitle: 'Rendez-vous médical', // Fallback default
-          doctorName: '',
-          datetimeISO: datetimeISO, // REQUIS pour créer un événement calendrier
-          location: ''
-        };
+  // Fonction pour nettoyer appointmentTitle (retirer mots inutiles, max 50 chars)
+  const cleanAppointmentTitle = (title) => {
+    if (!title || typeof title !== 'string') return null;
+    
+    let cleaned = title.trim();
+    
+    // Retirer les mots inutiles (insensible à la casse)
+    const uselessWords = [
+      'rendez-vous', 'rdv', 'rdv:', 'rendez vous',
+      'chez', 'à', 'le', 'la', 'les', 'pour', 'avec',
+      'docteur', 'dr', 'pr', 'professeur', 'médecin'
+    ];
+    
+    uselessWords.forEach(word => {
+      const regex = new RegExp(`\\b${word}\\b`, 'gi');
+      cleaned = cleaned.replace(regex, '').trim();
+    });
+    
+    // Nettoyer les espaces multiples
+    cleaned = cleaned.replace(/\s+/g, ' ').trim();
+    
+    // Limiter à 50 caractères
+    if (cleaned.length > 50) {
+      cleaned = cleaned.substring(0, 47) + '...';
+    }
+    
+    // Capitaliser première lettre
+    if (cleaned.length > 0) {
+      cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
+    }
+    
+    return cleaned || null;
+  };
+  
+  // Fonction pour normaliser doctorName (Dr <Nom> ou null)
+  const normalizeDoctorName = (doctorName, prescriberName = '') => {
+    if (!doctorName || typeof doctorName !== 'string') return null;
+    
+    let cleaned = doctorName.trim();
+    
+    // Retirer les titres et garder juste le nom avec "Dr"
+    cleaned = cleaned.replace(/^(docteur|dr\.?|pr\.?|professeur)\s+/i, '');
+    cleaned = cleaned.replace(/^(docteur|dr\.?|pr\.?|professeur)\s+/i, ''); // Au cas où il y en a deux
+    
+    // Nettoyer les espaces
+    cleaned = cleaned.replace(/\s+/g, ' ').trim();
+    
+    // Si on a un nom, préfixer avec "Dr"
+    if (cleaned.length > 0) {
+      // Capitaliser première lettre de chaque mot
+      cleaned = cleaned.split(' ').map(word => 
+        word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+      ).join(' ');
+      
+      return `Dr ${cleaned}`;
+    }
+    
+    return null;
+  };
+  
+  // Fonction pour parser datetimeISO (date + heure, défaut 09:00 si date seule)
+  const parseDateTimeISO = (dateStr, timeStr = null) => {
+    if (!dateStr || typeof dateStr !== 'string') return null;
+    
+    // Parser la date (formats: DD/MM/YYYY, DD-MM-YYYY, etc.)
+    const dateMatch = dateStr.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+    if (!dateMatch) {
+      // Essayer format ISO déjà présent
+      if (dateStr.includes('T') || dateStr.includes('Z')) {
+        return dateStr;
       }
       return null;
-    }).filter(apt => apt !== null);
+    }
+    
+    const [, day, month, year] = dateMatch;
+    
+    // Parser l'heure si présente
+    let hours = '09'; // Défaut 09:00
+    let minutes = '00';
+    
+    if (timeStr) {
+      const timeMatch = timeStr.match(/(\d{1,2})[:h](\d{2})/);
+      if (timeMatch) {
+        hours = timeMatch[1].padStart(2, '0');
+        minutes = timeMatch[2];
+      }
+    } else if (dateStr.match(/(\d{1,2})[:h](\d{2})/)) {
+      // Heure dans la même string que la date
+      const timeMatch = dateStr.match(/(\d{1,2})[:h](\d{2})/);
+      if (timeMatch) {
+        hours = timeMatch[1].padStart(2, '0');
+        minutes = timeMatch[2];
+      }
+    }
+    
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hours}:${minutes}:00+01:00`;
+  };
+  
+  // Normaliser le rendez-vous (nouveau format: rdv comme objet unique)
+  let rdv = null;
+  
+  // Support nouveau format: rdv (objet unique)
+  if (structured?.rdv && typeof structured.rdv === 'object') {
+    const rdvData = structured.rdv;
+    
+    // Nettoyer appointmentTitle
+    const rawTitle = rdvData.appointmentTitle || rdvData.title || rdvData.motif || '';
+    const appointmentTitle = cleanAppointmentTitle(rawTitle) || 'Rendez-vous médical';
+    
+    // Normaliser doctorName (NE PAS utiliser le prescripteur)
+    const doctorName = normalizeDoctorName(rdvData.doctorName || rdvData.doctor || rdvData.medecin || '');
+    
+    // Parser datetimeISO
+    const datetimeISO = parseDateTimeISO(
+      rdvData.datetimeISO || rdvData.datetime || rdvData.date || '',
+      rdvData.time || rdvData.heure || null
+    );
+    
+    // Location (null si absent)
+    const location = (rdvData.location || rdvData.lieu || rdvData.adresse || rdvData.address || '').trim() || null;
+    
+    // Note (null si absent)
+    const note = (rdvData.note || rdvData.notes || '').trim() || null;
+    
+    rdv = {
+      appointmentTitle,
+      doctorName,
+      datetimeISO,
+      location,
+      note
+    };
+  }
+  // Support ancien format: appointments (tableau) - compatibilité
+  else if (Array.isArray(structured?.appointments) && structured.appointments.length > 0) {
+    const apt = structured.appointments[0]; // Prendre le premier
+    
+    if (typeof apt === 'object' && apt !== null) {
+      const rawTitle = apt.appointmentTitle || apt.title || apt.motif || '';
+      const appointmentTitle = cleanAppointmentTitle(rawTitle) || 'Rendez-vous médical';
+      
+      const doctorName = normalizeDoctorName(apt.doctorName || apt.doctor || apt.medecin || '');
+      
+      const datetimeISO = parseDateTimeISO(
+        apt.datetimeISO || apt.datetime || apt.date || '',
+        apt.time || apt.heure || null
+      );
+      
+      const location = (apt.location || apt.lieu || apt.adresse || apt.address || '').trim() || null;
+      const note = (apt.note || apt.notes || '').trim() || null;
+      
+      rdv = {
+        appointmentTitle,
+        doctorName,
+        datetimeISO,
+        location,
+        note
+      };
+    }
+  }
+  
+  // Convertir rdv en appointments pour compatibilité (si rdv existe)
+  const appointments = rdv ? [rdv] : [];
+
+  // ===== TESTS/EXEMPLES D'EXTRACTION RDV (pour vérification) =====
+  // Ces tests peuvent être activés pour vérifier le comportement de l'extraction
+  if (process.env.TEST_RDV_EXTRACTION === 'true') {
+    console.log('[TEST_RDV] Tests d\'extraction RDV activés');
+    
+    // Test 1: "RDV échographie T2 Dr Martin le 12/02 à 14h"
+    const test1Title = 'RDV échographie T2 Dr Martin le 12/02 à 14h';
+    const test1Doctor = 'Dr Martin';
+    const test1Date = '12/02/2024';
+    const test1Time = '14h';
+    const cleaned1 = cleanAppointmentTitle(test1Title);
+    const doctor1 = normalizeDoctorName(test1Doctor);
+    const datetime1 = parseDateTimeISO(test1Date, test1Time);
+    console.log('[TEST_RDV] Test 1:', {
+      input: test1Title,
+      expected: { title: 'Échographie T2', doctor: 'Dr Martin', datetime: '2024-02-12T14:00:00+01:00' },
+      actual: { title: cleaned1, doctor: doctor1, datetime: datetime1 }
+    });
+    
+    // Test 2: "Consultation cardiologie 03/03"
+    const test2Title = 'Consultation cardiologie 03/03';
+    const test2Date = '03/03/2024';
+    const cleaned2 = cleanAppointmentTitle(test2Title);
+    const doctor2 = normalizeDoctorName(null);
+    const datetime2 = parseDateTimeISO(test2Date);
+    console.log('[TEST_RDV] Test 2:', {
+      input: test2Title,
+      expected: { title: 'Consultation cardiologie', doctor: null, datetime: '2024-03-03T09:00:00+01:00' },
+      actual: { title: cleaned2, doctor: doctor2, datetime: datetime2 }
+    });
+    
+    // Test 3: "RDV hôpital Pitié-Salpêtrière"
+    const test3Title = 'RDV hôpital Pitié-Salpêtrière';
+    const test3Location = 'Hôpital Pitié-Salpêtrière';
+    const cleaned3 = cleanAppointmentTitle(test3Title);
+    const doctor3 = normalizeDoctorName(null);
+    const datetime3 = parseDateTimeISO(null);
+    console.log('[TEST_RDV] Test 3:', {
+      input: test3Title,
+      expected: { title: 'Hôpital Pitié-Salpêtrière', doctor: null, datetime: null, location: test3Location },
+      actual: { title: cleaned3, doctor: doctor3, datetime: datetime3, location: test3Location }
+    });
   }
 
   const issueDate = structured?.issueDate || 
@@ -2305,14 +2443,13 @@ Retourne UNIQUEMENT un JSON valide respectant EXACTEMENT ce schéma :
     }
   ],
   "additionalInstructions": "",
-  "appointments": [
-    {
-      "appointmentTitle": "",
-      "doctorName": "",
-      "datetimeISO": "",
-      "location": ""
-    }
-  ],
+  "rdv": {
+    "appointmentTitle": "",
+    "doctorName": null,
+    "datetimeISO": null,
+    "location": null,
+    "note": null
+  },
   "issueDate": "",
   "confidenceScore": 0.0,
   "source": "OCR"
@@ -2320,13 +2457,26 @@ Retourne UNIQUEMENT un JSON valide respectant EXACTEMENT ce schéma :
 
 Règles strictes:
 - Ne jamais inventer d'information
-- Laisser les champs vides ("") si inconnus
+- Laisser les champs vides ("") ou null si inconnus
 - Extraire chaque médicament individuellement
-- Pour appointments:
-  * appointmentTitle: motif/acte principal (ex: "Échographie T2", "Consultation cardiologie"). Si absent, laisser vide (sera remplacé par "Rendez-vous médical" en fallback)
-  * doctorName: nom du médecin si présent (préfixer "Dr" seulement si cohérent avec le texte). Si absent, utiliser le nom du docteur prescripteur
-  * datetimeISO: date/heure au format ISO 8601 (ex: "2024-01-15T14:30:00+01:00"). REQUIS pour créer un événement calendrier. Si absent, laisser vide
-  * location: adresse/lieu si trouvé (ex: "15 Rue de la Paix, 75001 Paris", "Cabinet médical"). Si absent, laisser vide
+- Pour rdv (un seul rendez-vous par ordonnance):
+  * appointmentTitle: acte/motif principal NETTOYÉ (ex: "Échographie T2", "Consultation cardiologie", "Prise de sang"). 
+    - Retirer les mots inutiles: "rendez-vous", "RDV", "chez", "à", "le", "pour", etc.
+    - Garder court (max ~50 caractères)
+    - Majuscules/minuscules correctes (première lettre majuscule)
+    - Si rien trouvé: laisser vide (sera "Rendez-vous médical" en fallback)
+  * doctorName: nom du praticien si présent dans le texte (ex: "Dr Martin", "Docteur Dupont", "Pr. Bernard").
+    - Normaliser: "Dr <Nom>" si un nom est trouvé (retirer "Docteur", "Pr", "Professeur" et garder juste le nom avec "Dr")
+    - Si aucun nom de praticien trouvé: null (NE PAS utiliser le nom du docteur prescripteur)
+    - Ne pas inventer
+  * datetimeISO: date + heure au format ISO 8601 (ex: "2024-01-15T14:30:00+01:00").
+    - Parser date + heure si présentes
+    - Si seule la date est présente: mettre heure à 09:00 (ex: "2024-01-15T09:00:00+01:00")
+    - Si aucune date: null (le frontend demandera à l'utilisateur de compléter)
+  * location: cabinet/hôpital/adresse si détecté (ex: "Cabinet médical", "Hôpital Pitié-Salpêtrière", "15 Rue de la Paix, 75001 Paris").
+    - Si absent: null
+  * note: informations complémentaires optionnelles (pas affichées par défaut).
+    - Si absent: null
 - Calculer confidenceScore entre 0 et 1 selon la clarté du texte
 - Retourner UNIQUEMENT le JSON, sans texte supplémentaire`
           },
@@ -2779,27 +2929,28 @@ app.post('/api/ordonnance/finalize', (req, res) => {
       duration: med.duree || null
     }));
 
-    // Extraire les appointments structurés si présents dans structured
+    // Extraire le rdv structuré (nouveau format) ou appointments (ancien format)
+    let rdv = null;
     let appointments = [];
-    if (Array.isArray(structured.appointments) && structured.appointments.length > 0) {
-      // Normaliser les appointments (déjà fait par normalizeOrdonnance, mais on peut les extraire directement)
-      appointments = structured.appointments.map(apt => {
-        if (typeof apt === 'object' && apt !== null) {
-          // Appliquer les fallbacks
-          const appointmentTitle = apt.appointmentTitle || apt.title || apt.motif || 'Rendez-vous médical';
-          const doctorName = apt.doctorName || apt.doctor || apt.medecin || medecin || '';
-          const datetimeISO = apt.datetimeISO || apt.datetime || apt.date || '';
-          const location = apt.location || apt.lieu || apt.adresse || apt.address || '';
-          
-          return {
-            appointmentTitle: appointmentTitle,
-            doctorName: doctorName,
-            datetimeISO: datetimeISO, // REQUIS pour créer un événement calendrier
-            location: location
-          };
-        }
-        return null;
-      }).filter(apt => apt !== null);
+    
+    // Normaliser d'abord avec normalizeOrdonnance pour avoir le format standardisé
+    const normalized = normalizeOrdonnance(structured, texteBrut);
+    
+    // Utiliser rdv si présent (nouveau format)
+    if (normalized.rdv && typeof normalized.rdv === 'object') {
+      rdv = normalized.rdv;
+      appointments = [rdv]; // Compatibilité
+    } else if (Array.isArray(normalized.appointments) && normalized.appointments.length > 0) {
+      // Ancien format: prendre le premier appointment
+      const apt = normalized.appointments[0];
+      rdv = {
+        appointmentTitle: apt.appointmentTitle || 'Rendez-vous médical',
+        doctorName: apt.doctorName || null,
+        datetimeISO: apt.datetimeISO || null,
+        location: apt.location || null,
+        note: apt.note || null
+      };
+      appointments = [rdv];
     }
 
     // Préparer les données de l'ordonnance
@@ -2809,7 +2960,8 @@ app.post('/api/ordonnance/finalize', (req, res) => {
       doctorName: medecin || null,
       patientName: patient || null,
       medications: medications,
-      appointments: appointments, // Ajouter les appointments structurés
+      appointments: appointments, // Compatibilité (tableau)
+      rdv: rdv, // Nouveau format (objet unique)
       status: type === 'RENDEZ_VOUS' ? 'rdv_a_planifier' : 'a_recuperer',
       createdAt: new Date().toISOString(),
       type: type // Ajouter le type à l'ordonnance
