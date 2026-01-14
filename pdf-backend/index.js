@@ -4525,16 +4525,27 @@ function generateSummaryHash(personal, summary) {
   return hash.digest('hex').substring(0, 16); // 16 premiers caractères
 }
 
-// Route GET /api/passport/qr - Générer un token QR pour le Passeport Santé
-app.get('/api/passport/qr', (req, res) => {
-  console.log('[PASSPORT_QR] GET /api/passport/qr appelée');
+// Handler partagé pour GET et POST /api/passport/qr
+// IMPORTANT: Cette fonction garantit qu'on ne renvoie JAMAIS token:null
+function handlePassportQR(req, res) {
+  console.log(`[PASSPORT_QR] ${req.method} /api/passport/qr appelée`);
   
   try {
     // VALIDATION STRICTE: PASSPORT_QR_SECRET est REQUIS
+    // Log DEV: vérifier si le secret est présent
+    const hasPassportSecret = !!process.env.PASSPORT_QR_SECRET;
+    const hasQrSecret = !!process.env.QR_SECRET;
+    
+    console.log(`[PASSPORT_QR] DEV: PASSPORT_QR_SECRET présent: ${hasPassportSecret}, QR_SECRET présent: ${hasQrSecret}`);
+    
     const PASSPORT_SECRET = process.env.PASSPORT_QR_SECRET || process.env.QR_SECRET;
     
     if (!PASSPORT_SECRET || typeof PASSPORT_SECRET !== 'string' || PASSPORT_SECRET.trim().length === 0) {
       console.error('[PASSPORT_QR] ❌ PASSPORT_SECRET manquant ou invalide');
+      console.error('[PASSPORT_QR] ❌ PASSPORT_QR_SECRET:', hasPassportSecret ? 'présent' : 'MANQUANT');
+      console.error('[PASSPORT_QR] ❌ QR_SECRET:', hasQrSecret ? 'présent' : 'MANQUANT');
+      
+      // IMPORTANT: Ne JAMAIS renvoyer token:null, toujours une erreur
       return res.status(500).json({
         ok: false,
         error: 'PASSPORT_SECRET_MISSING',
@@ -4645,32 +4656,17 @@ app.get('/api/passport/qr', (req, res) => {
       exp: expiresAt
     };
     
-    // VALIDATION: Vérifier que le payload est valide
-    if (!payload || typeof payload !== 'object') {
-      console.error('[PASSPORT_QR] ❌ Payload invalide');
-      return res.status(500).json({
-        ok: false,
-        error: 'PASSPORT_TOKEN_GENERATION_FAILED',
-        message: 'Payload invalide pour la génération du token'
-      });
-    }
+    // Générer le token signé (version simple qui fonctionnait)
+    // IMPORTANT: createSignedToken lance une exception si échec, donc pas besoin de vérifier null
+    const token = createSignedToken(payload, PASSPORT_SECRET);
     
-    // Générer le token signé
-    let token;
-    try {
-      token = createSignedToken(payload, PASSPORT_SECRET);
-    } catch (tokenError) {
-      console.error('[PASSPORT_QR] ❌ Erreur lors de la génération du token:', tokenError.message);
-      return res.status(500).json({
-        ok: false,
-        error: 'PASSPORT_TOKEN_GENERATION_FAILED',
-        message: 'Erreur lors de la génération du token signé'
-      });
-    }
-    
-    // VALIDATION STRICTE: Le token ne doit JAMAIS être null ou vide
+    // VALIDATION FINALE: Le token ne doit JAMAIS être null ou vide
     if (!token || typeof token !== 'string' || token.trim().length === 0) {
       console.error('[PASSPORT_QR] ❌ Token généré est null ou vide');
+      console.error('[PASSPORT_QR] ❌ Payload:', JSON.stringify(payload));
+      console.error('[PASSPORT_QR] ❌ Secret présent:', !!PASSPORT_SECRET);
+      
+      // IMPORTANT: Ne JAMAIS renvoyer token:null, toujours une erreur
       return res.status(500).json({
         ok: false,
         error: 'PASSPORT_TOKEN_GENERATION_FAILED',
@@ -4699,18 +4695,36 @@ app.get('/api/passport/qr', (req, res) => {
     });
     
   } catch (error) {
-    console.error('[PASSPORT_QR] ❌ Erreur:', error.message);
+    // IMPORTANT: Ne JAMAIS renvoyer token:null, toujours une erreur explicite
+    console.error('[PASSPORT_QR] ❌ Erreur critique:', error.message);
     if (error.stack) {
       console.error('[PASSPORT_QR] Stack:', error.stack);
     }
     
-    return res.status(500).json({
+    // Logs DEV: détails supplémentaires en développement
+    const isDev = process.env.NODE_ENV !== 'production';
+    const errorResponse = {
       ok: false,
-      error: 'PASSPORT_QR_GENERATION_FAILED',
+      error: 'PASSPORT_TOKEN_GENERATION_FAILED',
       message: 'Erreur lors de la génération du token QR Passeport'
-    });
+    };
+    
+    if (isDev) {
+      errorResponse.details = error.message;
+      errorResponse.stack = error.stack;
+    }
+    
+    // IMPORTANT: Ne JAMAIS inclure token:null dans la réponse
+    return res.status(500).json(errorResponse);
   }
-});
+}
+
+// Route GET /api/passport/qr - Générer un token QR pour le Passeport Santé
+app.get('/api/passport/qr', handlePassportQR);
+
+// Route POST /api/passport/qr - Générer un token QR pour le Passeport Santé (alias POST)
+// Compatibilité: certaines apps peuvent appeler POST au lieu de GET
+app.post('/api/passport/qr', handlePassportQR);
 
 // Route GET /api/passport/resolve - Résoudre un token QR Passeport Santé
 app.get('/api/passport/resolve', (req, res) => {
