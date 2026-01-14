@@ -450,6 +450,39 @@ app.get('/billing/plan', (req, res) => {
   });
 });
 
+// Route POST /push/register-token - Enregistrer un token push Expo/EAS (stub)
+// Documentation:
+// - Route préparatoire pour l'enregistrement des tokens push Expo/EAS
+// - Actuellement retourne un stub {ok: true} sans traitement réel
+// - Ne pas activer côté UI tant qu'on n'a pas de dev build + credentials Expo
+// - Body attendu (pour préparer l'avenir):
+//   {
+//     userId: string,  // ID de l'utilisateur
+//     token: string    // Token push Expo (ExpoPushToken)
+//   }
+// - Plus tard: stocker le token en base de données, associer à userId, gérer les mises à jour
+app.post('/push/register-token', (req, res) => {
+  console.log('[PUSH] POST /push/register-token appelée (stub)');
+  
+  // Log léger des données reçues (pour debug, sans exposer le token complet)
+  const userId = req.body?.userId;
+  const token = req.body?.token;
+  const tokenPrefix = token && typeof token === 'string' && token.length >= 8 
+    ? token.substring(0, 8) + '...' 
+    : 'invalid';
+  
+  console.log(`[PUSH] userId: ${userId || 'missing'}, token: ${tokenPrefix}`);
+  
+  // Stub: retourner {ok: true} sans traitement réel
+  // TODO: Implémenter la logique réelle quand on aura:
+  // - Dev build Expo avec credentials configurés
+  // - Base de données pour stocker les tokens
+  // - Authentification pour valider userId
+  res.status(200).json({
+    ok: true
+  });
+});
+
 // Route GET /beacon - Beacon endpoint (silencieux pour éviter 404)
 app.get('/beacon', (req, res) => {
   res.status(204).end();
@@ -3059,6 +3092,15 @@ async function aiSummaryV2Handler(req, res) {
 
     const personal = req.body.personal;
     const ordonnances = req.body.ordonnances;
+    const healthProfile = req.body.healthProfile; // Optionnel
+    
+    // Sécurité: ne pas logger healthProfile en clair
+    const healthProfileHash = healthProfile 
+      ? createHash('sha256').update(JSON.stringify(healthProfile)).digest('hex').substring(0, 8)
+      : null;
+    if (healthProfile) {
+      console.log(`[AI_SUMMARY_V2] healthProfile reçu (hash: ${healthProfileHash})`);
+    }
     
     // Construire factsText pour OpenAI
     const factsParts = [];
@@ -3132,6 +3174,50 @@ async function aiSummaryV2Handler(req, res) {
       factsParts.push(...actionLines);
     }
     
+    // Ajouter le contexte patient (healthProfile) si présent
+    if (healthProfile && typeof healthProfile === 'object') {
+      factsParts.push('\n=== CONTEXTE PATIENT (DÉCLARÉ PAR L\'UTILISATEUR) ===');
+      
+      // Allergies déclarées
+      if (healthProfile.allergies && Array.isArray(healthProfile.allergies) && healthProfile.allergies.length > 0) {
+        factsParts.push(`Allergies déclarées: ${healthProfile.allergies.join(', ')}`);
+      }
+      
+      // Maladies chroniques
+      if (healthProfile.chronicDiseases && Array.isArray(healthProfile.chronicDiseases) && healthProfile.chronicDiseases.length > 0) {
+        factsParts.push(`Maladies chroniques déclarées: ${healthProfile.chronicDiseases.join(', ')}`);
+      }
+      
+      // Traitements au long cours
+      if (healthProfile.longTermTreatments && Array.isArray(healthProfile.longTermTreatments) && healthProfile.longTermTreatments.length > 0) {
+        const treatments = healthProfile.longTermTreatments.map(t => {
+          if (typeof t === 'string') return t;
+          if (typeof t === 'object' && t.name) return t.name + (t.dosage ? ` (${t.dosage})` : '');
+          return '';
+        }).filter(Boolean);
+        if (treatments.length > 0) {
+          factsParts.push(`Traitements au long cours déclarés: ${treatments.join(', ')}`);
+        }
+      }
+      
+      // Contact d'urgence
+      if (healthProfile.emergencyContact) {
+        const contact = healthProfile.emergencyContact;
+        const contactParts = [];
+        if (contact.name) contactParts.push(`Nom: ${contact.name}`);
+        if (contact.phone) contactParts.push(`Téléphone: ${contact.phone}`);
+        if (contact.relationship) contactParts.push(`Relation: ${contact.relationship}`);
+        if (contactParts.length > 0) {
+          factsParts.push(`Contact d'urgence déclaré: ${contactParts.join(', ')}`);
+        }
+      }
+      
+      // Autres informations déclaratives
+      if (healthProfile.otherInfo && typeof healthProfile.otherInfo === 'string' && healthProfile.otherInfo.trim()) {
+        factsParts.push(`Autres informations déclarées: ${healthProfile.otherInfo.trim()}`);
+      }
+    }
+    
     const factsText = factsParts.join('\n');
     
     // Générer le résumé fallback (toujours disponible)
@@ -3201,7 +3287,12 @@ async function aiSummaryV2Handler(req, res) {
       try {
         const client = new OpenAI({ apiKey: OPENAI_KEY });
         
-        const systemPrompt = `Tu fais une synthèse factuelle. Aucun diagnostic, aucun conseil médical, aucune interprétation clinique. N'invente rien. Structure la réponse en 3 à 6 puces, courtes.`;
+        // Construire le prompt système avec indication sur healthProfile
+        let systemPrompt = `Tu fais une synthèse factuelle. Aucun diagnostic, aucun conseil médical, aucune interprétation clinique. N'invente rien. Structure la réponse en 3 à 6 puces, courtes.`;
+        
+        if (healthProfile) {
+          systemPrompt += `\n\nIMPORTANT: La section "CONTEXTE PATIENT (DÉCLARÉ PAR L'UTILISATEUR)" contient des informations déclaratives fournies par l'utilisateur. Ne les invente pas, utilise-les uniquement si elles sont présentes dans cette section.`;
+        }
         
         const completion = await Promise.race([
           client.chat.completions.create({
@@ -3236,7 +3327,31 @@ async function aiSummaryV2Handler(req, res) {
       source = 'fallback';
     }
     
-    console.log("[AI_SUMMARY_V2] source=", source, "summaryLength=", summary.length);
+    // Inclure healthProfile dans le fallback si présent
+    if (source === 'fallback' && healthProfile) {
+      const healthParts = [];
+      if (healthProfile.allergies && Array.isArray(healthProfile.allergies) && healthProfile.allergies.length > 0) {
+        healthParts.push(`Allergies: ${healthProfile.allergies.join(', ')}`);
+      }
+      if (healthProfile.chronicDiseases && Array.isArray(healthProfile.chronicDiseases) && healthProfile.chronicDiseases.length > 0) {
+        healthParts.push(`Maladies chroniques: ${healthProfile.chronicDiseases.join(', ')}`);
+      }
+      if (healthProfile.longTermTreatments && Array.isArray(healthProfile.longTermTreatments) && healthProfile.longTermTreatments.length > 0) {
+        const treatments = healthProfile.longTermTreatments.map(t => {
+          if (typeof t === 'string') return t;
+          if (typeof t === 'object' && t.name) return t.name;
+          return '';
+        }).filter(Boolean);
+        if (treatments.length > 0) {
+          healthParts.push(`Traitements au long cours: ${treatments.join(', ')}`);
+        }
+      }
+      if (healthParts.length > 0) {
+        summary += (summary ? ' | ' : '') + healthParts.join(' | ');
+      }
+    }
+    
+    console.log("[AI_SUMMARY_V2] source=", source, "summaryLength=", summary.length, "healthProfile=", healthProfile ? `hash:${healthProfileHash}` : 'none');
 
     // Toujours retourner 200 avec summary non vide
     return res.status(200).json({
@@ -4024,15 +4139,90 @@ app.get('/api/passport/qr', (req, res) => {
     const patientId = req.query.patientId || req.body?.patientId;
     const personal = req.body?.personal;
     const summaryHash = req.query.summaryHash || req.body?.summaryHash;
+    const healthProfile = req.body?.healthProfile; // Optionnel
+    
+    // Sécurité: ne pas logger healthProfile en clair
+    const healthProfileHash = healthProfile 
+      ? createHash('sha256').update(JSON.stringify(healthProfile)).digest('hex').substring(0, 8)
+      : null;
+    if (healthProfile) {
+      console.log(`[PASSPORT_QR] healthProfile reçu (hash: ${healthProfileHash})`);
+    }
     
     // Générer un hash si on a personal + summary
+    // IMPORTANT: inclure healthProfile dans le hash pour éviter un mauvais cache
     let hash = summaryHash;
     if (!hash && personal && req.body?.summary) {
-      hash = generateSummaryHash(personal, req.body.summary);
-      // Stocker le résumé pour résolution ultérieure
+      // Construire une clé de cache qui inclut healthProfile (via updatedAt ou hash)
+      const cacheKeyParts = [
+        personal.nom || '',
+        personal.prenom || '',
+        req.body.summary
+      ];
+      
+      // Ajouter healthProfile dans la clé de cache
+      if (healthProfile) {
+        // Utiliser updatedAt si présent, sinon hash du contenu
+        const profileKey = healthProfile.updatedAt 
+          ? healthProfile.updatedAt 
+          : createHash('sha256').update(JSON.stringify(healthProfile)).digest('hex').substring(0, 16);
+        cacheKeyParts.push(profileKey);
+      }
+      
+      hash = createHash('sha256').update(cacheKeyParts.join('|')).digest('hex').substring(0, 16);
+      
+      // Construire le résumé enrichi avec healthProfile
+      let enrichedSummary = req.body.summary;
+      
+      // Ajouter healthProfile au résumé si présent
+      if (healthProfile) {
+        const healthParts = [];
+        
+        // Allergies
+        if (healthProfile.allergies && Array.isArray(healthProfile.allergies) && healthProfile.allergies.length > 0) {
+          healthParts.push(`Allergies: ${healthProfile.allergies.join(', ')}`);
+        }
+        
+        // Maladies chroniques
+        if (healthProfile.chronicDiseases && Array.isArray(healthProfile.chronicDiseases) && healthProfile.chronicDiseases.length > 0) {
+          healthParts.push(`Maladies chroniques: ${healthProfile.chronicDiseases.join(', ')}`);
+        }
+        
+        // Traitements au long cours
+        if (healthProfile.longTermTreatments && Array.isArray(healthProfile.longTermTreatments) && healthProfile.longTermTreatments.length > 0) {
+          const treatments = healthProfile.longTermTreatments.map(t => {
+            if (typeof t === 'string') return t;
+            if (typeof t === 'object' && t.name) return t.name + (t.dosage ? ` (${t.dosage})` : '');
+            return '';
+          }).filter(Boolean);
+          if (treatments.length > 0) {
+            healthParts.push(`Traitements au long cours: ${treatments.join(', ')}`);
+          }
+        }
+        
+        // Contact d'urgence
+        if (healthProfile.emergencyContact) {
+          const contact = healthProfile.emergencyContact;
+          const contactParts = [];
+          if (contact.name) contactParts.push(contact.name);
+          if (contact.phone) contactParts.push(contact.phone);
+          if (contact.relationship) contactParts.push(`(${contact.relationship})`);
+          if (contactParts.length > 0) {
+            healthParts.push(`Contact d'urgence: ${contactParts.join(' ')}`);
+          }
+        }
+        
+        // Ajouter au résumé
+        if (healthParts.length > 0) {
+          enrichedSummary = enrichedSummary + '\n\n' + healthParts.join('\n');
+        }
+      }
+      
+      // Stocker le résumé enrichi pour résolution ultérieure
       passportSummariesStorage.set(hash, {
-        summary: req.body.summary,
+        summary: enrichedSummary,
         personal,
+        healthProfile: healthProfile || null, // Stocker pour référence future
         generatedAt: new Date().toISOString()
       });
     }
@@ -4521,6 +4711,7 @@ app.use((req, res) => {
     'GET /beacon',
     'GET /healthz',
     'GET /billing/plan',
+    'POST /push/register-token',
       'POST /extract',
     'GET /ai/medical-summary/health',
     'GET /ai/medical_summary/health',
