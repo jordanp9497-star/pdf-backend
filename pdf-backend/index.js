@@ -218,6 +218,7 @@ function createOrdonnance(data) {
     doctorName: data.doctorName || null,
     patientName: data.patientName || null,
     medications: data.medications || [],
+    appointments: data.appointments || [], // Appointments structurés
     status: data.status || 'a_recuperer',
     createdAt: data.createdAt || new Date().toISOString(),
     type: data.type || null // Type d'ordonnance (MEDICAMENT ou RENDEZ_VOUS)
@@ -229,6 +230,7 @@ function createOrdonnance(data) {
   console.log('[ORD STORE] ID:', ordonnance.id);
   console.log('[ORD STORE] Source:', ordonnance.source);
   console.log('[ORD STORE] Type:', ordonnance.type || 'non spécifié');
+  console.log('[ORD STORE] Appointments:', ordonnance.appointments?.length || 0);
   console.log('[ORD STORE] Total ordonnances:', ordonnances.length);
 
   return ordonnance;
@@ -1353,9 +1355,75 @@ function normalizeOrdonnance(structured, rawText = '') {
                                  structured?.observations || 
                                  '';
 
-  const appointments = Array.isArray(structured?.appointments) 
-    ? structured.appointments 
-    : [];
+  // Normaliser les rendez-vous avec les nouveaux champs structurés
+  let appointments = [];
+  if (Array.isArray(structured?.appointments)) {
+    appointments = structured.appointments.map(apt => {
+      // Si c'est déjà un objet structuré, normaliser
+      if (typeof apt === 'object' && apt !== null) {
+        // Parser datetimeISO si présent
+        let datetimeISO = apt.datetimeISO || apt.datetime || apt.date || '';
+        
+        // Si datetimeISO est une date simple (sans heure), essayer de la convertir
+        if (datetimeISO && !datetimeISO.includes('T') && !datetimeISO.includes('Z')) {
+          // Formats de date courants: DD/MM/YYYY, DD-MM-YYYY, etc.
+          const dateMatch = datetimeISO.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+          if (dateMatch) {
+            const [, day, month, year] = dateMatch;
+            // Créer une date ISO avec heure par défaut (midi) si pas d'heure spécifiée
+            datetimeISO = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T12:00:00+01:00`;
+          }
+        }
+        
+        // Extraire l'heure si présente dans le texte mais pas dans datetimeISO
+        const timeMatch = apt.time || apt.heure || '';
+        if (timeMatch && datetimeISO && !datetimeISO.includes('T')) {
+          // Essayer d'ajouter l'heure à la date
+          const timeParts = timeMatch.match(/(\d{1,2})[:h](\d{2})/);
+          if (timeParts) {
+            const [, hours, minutes] = timeParts;
+            const datePart = datetimeISO.split('T')[0];
+            datetimeISO = `${datePart}T${hours.padStart(2, '0')}:${minutes}:00+01:00`;
+          }
+        }
+        
+        // Fallback: appointmentTitle default si absent
+        const appointmentTitle = apt.appointmentTitle || apt.title || apt.motif || 'Rendez-vous médical';
+        
+        // Fallback: utiliser le nom du docteur prescripteur si absent
+        const doctorName = apt.doctorName || apt.doctor || apt.medecin || '';
+        
+        return {
+          appointmentTitle: appointmentTitle,
+          doctorName: doctorName,
+          datetimeISO: datetimeISO, // REQUIS pour créer un événement calendrier
+          location: apt.location || apt.lieu || apt.adresse || apt.address || ''
+        };
+      }
+      // Si c'est une string (ancien format), essayer de parser
+      if (typeof apt === 'string') {
+        // Parser basique pour les strings
+        const dateMatch = apt.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+        const timeMatch = apt.match(/(\d{1,2})[:h](\d{2})/);
+        
+        let datetimeISO = '';
+        if (dateMatch) {
+          const [, day, month, year] = dateMatch;
+          const hours = timeMatch ? timeMatch[1] : '12';
+          const minutes = timeMatch ? timeMatch[2] : '00';
+          datetimeISO = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hours.padStart(2, '0')}:${minutes}:00+01:00`;
+        }
+        
+        return {
+          appointmentTitle: 'Rendez-vous médical', // Fallback default
+          doctorName: '',
+          datetimeISO: datetimeISO, // REQUIS pour créer un événement calendrier
+          location: ''
+        };
+      }
+      return null;
+    }).filter(apt => apt !== null);
+  }
 
   const issueDate = structured?.issueDate || 
                     structured?.date || 
@@ -2060,6 +2128,24 @@ function transformOrdonnanceForFrontend(normalized) {
     transformed.medicaments = [];
   }
   
+  // S'assurer que appointments est présent et bien formaté
+  if (!Array.isArray(transformed.appointments)) {
+    transformed.appointments = [];
+  } else {
+    // Appliquer les fallbacks aux appointments
+    transformed.appointments = transformed.appointments.map(apt => {
+      if (typeof apt === 'object' && apt !== null) {
+        return {
+          appointmentTitle: apt.appointmentTitle || 'Rendez-vous médical',
+          doctorName: apt.doctorName || '',
+          datetimeISO: apt.datetimeISO || '', // REQUIS pour créer un événement calendrier
+          location: apt.location || ''
+        };
+      }
+      return null;
+    }).filter(apt => apt !== null);
+  }
+  
   return transformed;
 }
 
@@ -2219,7 +2305,14 @@ Retourne UNIQUEMENT un JSON valide respectant EXACTEMENT ce schéma :
     }
   ],
   "additionalInstructions": "",
-  "appointments": [],
+  "appointments": [
+    {
+      "appointmentTitle": "",
+      "doctorName": "",
+      "datetimeISO": "",
+      "location": ""
+    }
+  ],
   "issueDate": "",
   "confidenceScore": 0.0,
   "source": "OCR"
@@ -2229,6 +2322,11 @@ Règles strictes:
 - Ne jamais inventer d'information
 - Laisser les champs vides ("") si inconnus
 - Extraire chaque médicament individuellement
+- Pour appointments:
+  * appointmentTitle: motif/acte principal (ex: "Échographie T2", "Consultation cardiologie"). Si absent, laisser vide (sera remplacé par "Rendez-vous médical" en fallback)
+  * doctorName: nom du médecin si présent (préfixer "Dr" seulement si cohérent avec le texte). Si absent, utiliser le nom du docteur prescripteur
+  * datetimeISO: date/heure au format ISO 8601 (ex: "2024-01-15T14:30:00+01:00"). REQUIS pour créer un événement calendrier. Si absent, laisser vide
+  * location: adresse/lieu si trouvé (ex: "15 Rue de la Paix, 75001 Paris", "Cabinet médical"). Si absent, laisser vide
 - Calculer confidenceScore entre 0 et 1 selon la clarté du texte
 - Retourner UNIQUEMENT le JSON, sans texte supplémentaire`
           },
@@ -2681,6 +2779,29 @@ app.post('/api/ordonnance/finalize', (req, res) => {
       duration: med.duree || null
     }));
 
+    // Extraire les appointments structurés si présents dans structured
+    let appointments = [];
+    if (Array.isArray(structured.appointments) && structured.appointments.length > 0) {
+      // Normaliser les appointments (déjà fait par normalizeOrdonnance, mais on peut les extraire directement)
+      appointments = structured.appointments.map(apt => {
+        if (typeof apt === 'object' && apt !== null) {
+          // Appliquer les fallbacks
+          const appointmentTitle = apt.appointmentTitle || apt.title || apt.motif || 'Rendez-vous médical';
+          const doctorName = apt.doctorName || apt.doctor || apt.medecin || medecin || '';
+          const datetimeISO = apt.datetimeISO || apt.datetime || apt.date || '';
+          const location = apt.location || apt.lieu || apt.adresse || apt.address || '';
+          
+          return {
+            appointmentTitle: appointmentTitle,
+            doctorName: doctorName,
+            datetimeISO: datetimeISO, // REQUIS pour créer un événement calendrier
+            location: location
+          };
+        }
+        return null;
+      }).filter(apt => apt !== null);
+    }
+
     // Préparer les données de l'ordonnance
     const ordonnanceData = {
       source: 'ocr_manuscrit',
@@ -2688,6 +2809,7 @@ app.post('/api/ordonnance/finalize', (req, res) => {
       doctorName: medecin || null,
       patientName: patient || null,
       medications: medications,
+      appointments: appointments, // Ajouter les appointments structurés
       status: type === 'RENDEZ_VOUS' ? 'rdv_a_planifier' : 'a_recuperer',
       createdAt: new Date().toISOString(),
       type: type // Ajouter le type à l'ordonnance
@@ -2706,6 +2828,24 @@ app.post('/api/ordonnance/finalize', (req, res) => {
       console.log('[FINALIZE] Type RENDEZ_VOUS - Préparation orientation Doctolib');
       // Marquer l'ordonnance comme RDV
       ordonnance.isRdv = true;
+      
+      // Log des appointments pour debug
+      if (appointments.length > 0) {
+        appointments.forEach((apt, idx) => {
+          console.log(`[FINALIZE] Appointment ${idx + 1}:`, {
+            title: apt.appointmentTitle,
+            doctor: apt.doctorName,
+            datetime: apt.datetimeISO || 'MANQUANT (demander à l\'utilisateur de compléter)',
+            location: apt.location || 'Non spécifié'
+          });
+          
+          // Avertir si datetimeISO est absent (requis pour calendrier)
+          if (!apt.datetimeISO || apt.datetimeISO.trim() === '') {
+            console.warn(`[FINALIZE] ⚠️ Appointment ${idx + 1} sans datetimeISO - ne pourra pas créer d'événement calendrier`);
+          }
+        });
+      }
+      
       // TODO: Préparer l'orientation Doctolib
       // Exemple : générer un lien Doctolib ou appeler une API Doctolib
     }
