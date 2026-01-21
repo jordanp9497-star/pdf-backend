@@ -3,3 +3,6 @@ node_modules/
 *.log
 .DS_Store
 
+# BDPM index (généré localement)
+data/bdpm_index.json
+

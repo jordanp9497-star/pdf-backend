@@ -127,6 +127,11 @@ import aiSummaryRouter from './routes/aiSummary.routes.js';
 app.use('/ai', aiSummaryRouter);
 console.log('[AI_SUMMARY] routes mounted on /ai (medical-summary + medical_summary)');
 
+// ===== ROUTES MEDS =====
+import medsRouter from './routes/meds.routes.js';
+app.use('/meds', medsRouter);
+console.log('[MEDS] routes mounted on /meds (resolve-substances)');
+
 // Fonction pour lister les routes montées
 function logRegisteredRoutes() {
   console.log('[ROUTES] Routes enregistrées:');
