@@ -349,7 +349,6 @@ router.get('/cancel', (req, res) => {
   res.status(200).send('CANCELED');
 });
 
-// Exporter la fonction helper et le handler webhook pour utilisation dans d'autres fichiers
-export { isSubscribed, handleStripeWebhook };
+// Les fonctions isSubscribed et handleStripeWebhook sont déjà exportées individuellement ci-dessus
 
 export default router;
