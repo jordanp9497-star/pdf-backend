@@ -1,12 +1,13 @@
-// ===== CHARGEMENT DES VARIABLES D'ENVIRONNEMENT EN PREMIER =====
-// CRITIQUE: dotenv.config() DOIT être appelé AVANT tout autre import local
-// pour garantir que les variables d'environnement sont disponibles
-import dotenv from "dotenv";
-dotenv.config();
+// ===== CONFIGURATION CENTRALISÉE =====
+// Chargement et validation des variables d'environnement
+// dotenv est géré dans src/config/env.ts (uniquement en DEV)
+import { logEnvStatus } from './src/config/env.js';
 
 console.log("✅ BOOT SIGNATURE __BUILD_CHECK");
 console.log("🚀 Backend started");
-console.log("NODE_ENV:", process.env.NODE_ENV);
+
+// Logs sécurisés des variables d'environnement
+logEnvStatus();
 
 // Logs temporaires de diagnostic
 console.log("🔥 STARTUP FILE:", import.meta.url);
@@ -43,9 +44,17 @@ import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import { randomUUID, createHmac, createHash } from 'crypto';
 import OpenAI from 'openai';
+import { APP_CONFIG } from './src/config/env.js';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = APP_CONFIG.port;
+
+// ===== WEBHOOK STRIPE (AVANT LES BODY PARSERS) =====
+// Le webhook Stripe nécessite le body en raw pour vérifier la signature
+// IMPORTANT: Cette route doit être montée AVANT express.json()
+import { handleStripeWebhook } from './routes/billing.routes.js';
+app.post('/billing/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+console.log('[BILLING] Webhook route mounted (POST /billing/webhook) - before body parsers');
 
 // ===== ENDPOINT HEALTHZ GLOBAL =====
 app.get("/healthz", (req, res) => {
@@ -61,6 +70,7 @@ console.log('ENV CHECK → OPENAI (locals):', !!app.locals.OPENAI_API_KEY);
 // Log SAFE pour confirmer la présence de la clé OpenAI sans l'afficher
 const k = process.env.OPENAI_API_KEY;
 console.log("[ENV] OPENAI_API_KEY present =", !!k, "len =", k ? k.length : 0, "prefix =", k ? k.slice(0, 10) : null);
+
 
 // ===== CONFIGURATION DES BODY PARSERS AU TOUT DÉBUT =====
 // CRITIQUE: Ces middlewares DOIVENT être placés AVANT tout autre middleware
@@ -122,6 +132,16 @@ console.log('🔍 Route POST /api/ocr/handwritten enregistrée');
 // Configuration CORS
 app.use(cors());
 
+// ===== MIDDLEWARES D'AUTHENTIFICATION =====
+import { authenticateSupabase } from './middlewares/auth.js';
+import { requireProfileRole } from './middlewares/profileRole.js';
+
+// Exporter les middlewares pour utilisation dans les routes
+app.locals.authenticateSupabase = authenticateSupabase;
+app.locals.requireProfileRole = requireProfileRole;
+
+console.log('[AUTH] Middlewares d\'authentification Supabase chargés');
+
 // ===== ROUTES AI SUMMARY (dash + underscore) =====
 import aiSummaryRouter from './routes/aiSummary.routes.js';
 app.use('/ai', aiSummaryRouter);
@@ -131,6 +151,22 @@ console.log('[AI_SUMMARY] routes mounted on /ai (medical-summary + medical_summa
 import medsRouter from './routes/meds.routes.js';
 app.use('/meds', medsRouter);
 console.log('[MEDS] routes mounted on /meds (resolve-substances)');
+
+// ===== ROUTES BILLING =====
+// Le webhook est monté séparément avant les body parsers (voir plus haut)
+// Les autres routes billing sont montées ici
+app.use('/billing', billingRouter);
+console.log('[BILLING] routes mounted (POST /billing/create-checkout-session)');
+
+// ===== ROUTES DEBUG (DEV uniquement) =====
+import debugRouter from './routes/debug.routes.js';
+app.use('/debug', debugRouter);
+console.log('[DEBUG] routes mounted (GET /debug/env - DEV only)');
+
+// ===== ROUTES INVITES =====
+import invitesRouter from './routes/invites.routes.js';
+app.use('/', invitesRouter); // Routes: /profiles/:profileId/invites et /invites/accept
+console.log('[INVITES] routes mounted (POST /profiles/:profileId/invites, POST /invites/accept)');
 
 // Fonction pour lister les routes montées
 function logRegisteredRoutes() {
@@ -5216,6 +5252,7 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`✅ Serveur démarré sur http://localhost:${PORT}`);
+  console.log(`[APP] Base URL: ${APP_CONFIG.baseUrl}`);
   
   // Lister les routes montées
   try {
