@@ -155,6 +155,7 @@ console.log('[MEDS] routes mounted on /meds (resolve-substances)');
 // ===== ROUTES BILLING =====
 // Le webhook est monté séparément avant les body parsers (voir plus haut)
 // Les autres routes billing sont montées ici
+import billingRouter from './routes/billing.routes.js';
 app.use('/billing', billingRouter);
 console.log('[BILLING] routes mounted (POST /billing/create-checkout-session)');
 
