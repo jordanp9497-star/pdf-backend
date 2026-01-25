@@ -75,7 +75,16 @@ router.post('/:id/recovered',
         });
       }
 
-      const userId = req.user.id;
+      // Utiliser req.userId (défini par authenticateSupabase)
+      const userId = req.userId || req.user?.id;
+      
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error: 'UNAUTHORIZED',
+          message: 'Authentification requise'
+        });
+      }
 
       console.log('[ORDONNANCES] POST /ordonnances/:id/recovered', {
         ordonnanceId,
@@ -83,83 +92,108 @@ router.post('/:id/recovered',
         recoveredAt
       });
 
-      // Mettre à jour dans Supabase si disponible
-      if (supabase) {
-        try {
-          const { data, error } = await supabase
-            .from('ordonnances')
-            .update({
-              recovered_at: recoveredAt,
-              updated_at: new Date().toISOString()
-            })
-            .eq('id', ordonnanceId)
-            .eq('user_id', userId) // Sécurité: s'assurer que l'ordonnance appartient à l'utilisateur
-            .select('id, recovered_at')
-            .single();
+      // Vérifier que Supabase est configuré
+      if (!supabase) {
+        console.error('[ORDONNANCES] ❌ Supabase admin client non initialisé');
+        return res.status(500).json({
+          ok: false,
+          error: 'DATABASE_ERROR',
+          message: 'Erreur lors de la mise à jour de l\'ordonnance'
+        });
+      }
 
-          if (error) {
-            // Si l'erreur est "PGRST116" (no rows returned), l'ordonnance n'existe pas ou n'appartient pas à l'utilisateur
-            if (error.code === 'PGRST116' || error.message?.includes('No rows')) {
-              console.log(`[ORDONNANCES] ❌ Ordonnance ${ordonnanceId} non trouvée ou n'appartient pas à l'utilisateur ${userId}`);
-              return res.status(404).json({
-                ok: false,
-                error: 'NOT_FOUND',
-                message: 'Ordonnance non trouvée ou vous n\'avez pas les permissions'
-              });
-            }
+      try {
+        // Mettre à jour l'ordonnance
+        const { data, error } = await supabase
+          .from('ordonnances')
+          .update({
+            recovered_at: recoveredAt,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', ordonnanceId)
+          .eq('user_id', userId) // Sécurité: s'assurer que l'ordonnance appartient à l'utilisateur
+          .select('id, recovered_at');
 
-            console.error('[ORDONNANCES] ❌ Erreur lors de la mise à jour:', error);
-            return res.status(500).json({
-              ok: false,
-              error: 'DATABASE_ERROR',
-              message: 'Erreur lors de la mise à jour de l\'ordonnance'
-            });
-          }
-
-          if (!data) {
-            return res.status(404).json({
-              ok: false,
-              error: 'NOT_FOUND',
-              message: 'Ordonnance non trouvée'
-            });
-          }
-
-          console.log(`[ORDONNANCES] ✅ Ordonnance ${ordonnanceId} marquée comme récupérée`);
-
-          return res.status(200).json({
-            ok: true,
-            ordonnanceId: data.id,
-            recoveredAt: data.recovered_at
+        if (error) {
+          // Log détaillé de l'erreur
+          console.error('[ORDONNANCES] update recovered failed', {
+            id: ordonnanceId,
+            userId: userId,
+            recoveredAt: recoveredAt,
+            errorMessage: error.message,
+            errorDetails: error.details,
+            errorHint: error.hint,
+            errorCode: error.code
           });
 
-        } catch (dbError) {
-          console.error('[ORDONNANCES] ❌ Erreur base de données:', dbError);
           return res.status(500).json({
             ok: false,
             error: 'DATABASE_ERROR',
             message: 'Erreur lors de la mise à jour de l\'ordonnance'
           });
         }
-      } else {
-        // Fallback: Supabase non configuré (MVP sans persistance)
-        console.warn('[ORDONNANCES] ⚠️ TODO: Supabase non configuré, réponse OK sans persistance');
-        console.warn('[ORDONNANCES] ⚠️ TODO: Implémenter la persistance dans la table ordonnances');
-        
+
+        // Vérifier si aucune ligne n'a été mise à jour (0 rows updated)
+        if (!data || data.length === 0) {
+          console.log(`[ORDONNANCES] ❌ Ordonnance ${ordonnanceId} non trouvée ou n'appartient pas à l'utilisateur ${userId}`);
+          return res.status(404).json({
+            ok: false,
+            error: 'NOT_FOUND',
+            message: 'Ordonnance non trouvée ou vous n\'avez pas les permissions'
+          });
+        }
+
+        // Succès: log et retourner la réponse
+        console.log('[ORDONNANCES] recovered updated', {
+          id: ordonnanceId,
+          userId: userId,
+          recoveredAt: data[0].recovered_at
+        });
+
         return res.status(200).json({
           ok: true,
-          ordonnanceId: ordonnanceId,
+          ordonnanceId: data[0].id,
+          recoveredAt: data[0].recovered_at
+        });
+
+      } catch (dbError) {
+        // Log détaillé de l'exception
+        console.error('[ORDONNANCES] update recovered failed', {
+          id: ordonnanceId,
+          userId: userId,
           recoveredAt: recoveredAt,
-          _warning: 'TODO: Persistance non implémentée (Supabase non configuré)'
+          errorMessage: dbError?.message,
+          errorDetails: dbError?.details,
+          errorHint: dbError?.hint,
+          errorStack: dbError?.stack
+        });
+
+        return res.status(500).json({
+          ok: false,
+          error: 'DATABASE_ERROR',
+          message: 'Erreur lors de la mise à jour de l\'ordonnance'
         });
       }
 
     } catch (error) {
       console.error('[ORDONNANCES] ❌ Erreur inattendue:', error);
-      return res.status(500).json({
+      
+      // Réponse 500 avec debug en DEV
+      const response = {
         ok: false,
         error: 'INTERNAL_ERROR',
         message: 'Erreur lors de la mise à jour de l\'ordonnance'
-      });
+      };
+
+      // Ajouter debug en DEV uniquement
+      if (process.env.NODE_ENV !== 'production') {
+        response.debug = {
+          message: error?.message || 'Unknown error',
+          stack: error?.stack || null
+        };
+      }
+
+      return res.status(500).json(response);
     }
   }
 );

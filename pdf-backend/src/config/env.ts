@@ -61,12 +61,33 @@ export const APP_CONFIG = {
 } as const;
 
 /**
+ * Détermine le type de clé Supabase (anon ou service_role)
+ */
+function getSupabaseKeyType(key: string | undefined, envVarName: string): string {
+  if (!key) return 'none';
+  // Détecter via le nom de la variable d'environnement
+  if (envVarName.includes('ANON') || envVarName.includes('anon')) return 'anon';
+  if (envVarName.includes('SERVICE_ROLE') || envVarName.includes('service_role')) return 'service_role';
+  // Détecter via la longueur (les clés anon sont généralement plus courtes)
+  // Les clés service_role commencent souvent par "eyJ..." et sont plus longues
+  if (key.length > 200) return 'service_role';
+  return 'anon';
+}
+
+/**
  * Logs sécurisés au démarrage (sans exposer les clés complètes)
  */
 export function logEnvStatus() {
-  console.log('[ENV] SUPABASE_URL present:', !!SUPABASE_CONFIG.url);
+  // Logs Supabase
+  console.log('[ENV] SUPABASE_URL:', SUPABASE_CONFIG.url || '❌ absent');
   console.log('[ENV] SUPABASE_SERVICE_ROLE_KEY present:', !!SUPABASE_CONFIG.serviceRoleKey, 
-    `(masked: ${maskKey(SUPABASE_CONFIG.serviceRoleKey)})`);
+    `(masked: ${maskKey(SUPABASE_CONFIG.serviceRoleKey)}, type: ${getSupabaseKeyType(SUPABASE_CONFIG.serviceRoleKey, 'SUPABASE_SERVICE_ROLE_KEY')})`);
+  
+  // Vérifier aussi SUPABASE_ANON_KEY (pour l'auth)
+  const anonKey = process.env.SUPABASE_ANON_KEY;
+  console.log('[ENV] SUPABASE_ANON_KEY present:', !!anonKey,
+    anonKey ? `(masked: ${maskKey(anonKey)}, type: ${getSupabaseKeyType(anonKey, 'SUPABASE_ANON_KEY')})` : '');
+  
   console.log('[ENV] SUPABASE_JWT_JWKS_URL:', SUPABASE_CONFIG.jwtJwksUrl);
   
   console.log('[ENV] STRIPE_SECRET_KEY present:', !!STRIPE_CONFIG.secretKey,
