@@ -148,7 +148,7 @@ router.post('/:id/recovered',
           });
         }
 
-        // 2. Si l'ordonnance existe (update réussi), retourner succès
+        // 2. Si l'ordonnance existe (update réussi), créer l'audit log et retourner succès
         if (updateData && updateData.length > 0) {
           console.log('[ORDONNANCES] recovered updated', {
             id: ordonnanceId,
@@ -156,6 +156,29 @@ router.post('/:id/recovered',
             recoveredAt: recoveredAt,
             created: false
           });
+
+          // Créer l'audit log
+          try {
+            await supabase
+              .from('audit_log')
+              .insert({
+                actor_user_id: userId,
+                patient_user_id: userId, // Le patient est le propriétaire de l'ordonnance
+                action: 'ORDONNANCE_MARK_RECOVERED',
+                entity_type: 'ordonnance',
+                entity_id: ordonnanceId,
+                metadata: {
+                  recoveredAt: recoveredAt,
+                  created: false
+                },
+                created_at: new Date().toISOString()
+              });
+
+            console.log('[ORDONNANCES] ✅ Audit log créé pour update');
+          } catch (auditError) {
+            // Log l'erreur mais ne bloque pas la réponse
+            console.error('[ORDONNANCES] ⚠️ Erreur lors de la création de l\'audit log:', auditError);
+          }
 
           return res.status(200).json({
             ok: true,
@@ -200,13 +223,36 @@ router.post('/:id/recovered',
           });
         }
 
-        // 4. Succès: ordonnance créée
+        // 4. Succès: ordonnance créée, créer l'audit log et retourner succès
         console.log('[ORDONNANCES] recovered created', {
           id: ordonnanceId,
           userId: userId,
           recoveredAt: recoveredAt,
           created: true
         });
+
+        // Créer l'audit log
+        try {
+          await supabase
+            .from('audit_log')
+            .insert({
+              actor_user_id: userId,
+              patient_user_id: userId, // Le patient est le propriétaire de l'ordonnance
+              action: 'ORDONNANCE_MARK_RECOVERED',
+              entity_type: 'ordonnance',
+              entity_id: ordonnanceId,
+              metadata: {
+                recoveredAt: recoveredAt,
+                created: true
+              },
+              created_at: new Date().toISOString()
+            });
+
+          console.log('[ORDONNANCES] ✅ Audit log créé pour création');
+        } catch (auditError) {
+          // Log l'erreur mais ne bloque pas la réponse
+          console.error('[ORDONNANCES] ⚠️ Erreur lors de la création de l\'audit log:', auditError);
+        }
 
         return res.status(200).json({
           ok: true,

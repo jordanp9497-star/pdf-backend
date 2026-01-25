@@ -169,6 +169,16 @@ import ordonnancesRouter from './routes/ordonnances.routes.js';
 app.use('/ordonnances', ordonnancesRouter);
 console.log('[ORDONNANCES] routes mounted (POST /ordonnances/:id/recovered)');
 
+// ===== ROUTES DEVICES =====
+import devicesRouter from './routes/devices.routes.js';
+app.use('/devices', devicesRouter);
+console.log('[DEVICES] routes mounted (POST /devices/heartbeat)');
+
+// ===== ROUTES CARE (Patient <-> Aidant) =====
+import careRouter from './routes/care.routes.js';
+app.use('/care', careRouter);
+console.log('[CARE] routes mounted (POST /care/invite, POST /care/accept, POST /care/revoke)');
+
 // ===== ROUTES INVITES =====
 import invitesRouter from './routes/invites.routes.js';
 app.use('/', invitesRouter); // Routes: /profiles/:profileId/invites et /invites/accept
@@ -5223,6 +5233,10 @@ app.use((req, res) => {
     'POST /ai/medical-summary-v2',
     'POST /ai/medical_summary_v2',
     'POST /ordonnances/:id/recovered',
+    'POST /devices/heartbeat',
+    'POST /care/invite',
+    'POST /care/accept',
+    'POST /care/revoke',
       'POST /analyze-ordonnance',
       'POST /analyze-ordonnance-test',
       'GET /test-n8n',
