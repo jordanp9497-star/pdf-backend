@@ -164,6 +164,11 @@ import debugRouter from './routes/debug.routes.js';
 app.use('/debug', debugRouter);
 console.log('[DEBUG] routes mounted (GET /debug/env - DEV only)');
 
+// ===== ROUTES ORDONNANCES =====
+import ordonnancesRouter from './routes/ordonnances.routes.js';
+app.use('/ordonnances', ordonnancesRouter);
+console.log('[ORDONNANCES] routes mounted (POST /ordonnances/:id/recovered)');
+
 // ===== ROUTES INVITES =====
 import invitesRouter from './routes/invites.routes.js';
 app.use('/', invitesRouter); // Routes: /profiles/:profileId/invites et /invites/accept
@@ -5217,6 +5222,7 @@ app.use((req, res) => {
     'POST /ai/medical_summary',
     'POST /ai/medical-summary-v2',
     'POST /ai/medical_summary_v2',
+    'POST /ordonnances/:id/recovered',
       'POST /analyze-ordonnance',
       'POST /analyze-ordonnance-test',
       'GET /test-n8n',
