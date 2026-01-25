@@ -20,9 +20,18 @@ const supabase = supabaseAdmin;
  * - Requiert authentification (Bearer token Supabase)
  * - Valide req.params.id et req.body.recoveredAt
  * - Met à jour recovered_at dans la table ordonnances
+ * - Si l'ordonnance n'existe pas, la crée à la volée (MVP)
  * 
- * Body: { recoveredAt: string (ISO date) }
- * Retourne: { ok: true, ordonnanceId: string, recoveredAt: string }
+ * Body: { 
+ *   recoveredAt: string (ISO date),
+ *   ordonnance?: object (optionnel, données supplémentaires à stocker dans data)
+ * }
+ * Retourne: { 
+ *   ok: true, 
+ *   ordonnanceId: string, 
+ *   recoveredAt: string,
+ *   created: boolean (true si créée, false si mise à jour)
+ * }
  */
 router.post('/:id/recovered',
   authenticateSupabase,
@@ -56,7 +65,7 @@ router.post('/:id/recovered',
         });
       }
 
-      const { recoveredAt } = req.body;
+      const { recoveredAt, ordonnance } = req.body;
       if (!recoveredAt || typeof recoveredAt !== 'string' || recoveredAt.trim() === '') {
         return res.status(400).json({
           ok: false,
@@ -73,6 +82,12 @@ router.post('/:id/recovered',
           error: 'BAD_REQUEST',
           message: 'Le champ "recoveredAt" doit être une date ISO valide'
         });
+      }
+
+      // Optionnel: valider le champ ordonnance si fourni
+      let ordonnanceData = {};
+      if (ordonnance && typeof ordonnance === 'object') {
+        ordonnanceData = ordonnance;
       }
 
       // Utiliser req.userId (défini par authenticateSupabase)
@@ -103,8 +118,8 @@ router.post('/:id/recovered',
       }
 
       try {
-        // Mettre à jour l'ordonnance
-        const { data, error } = await supabase
+        // 1. Essayer d'abord de mettre à jour l'ordonnance existante
+        const { data: updateData, error: updateError } = await supabase
           .from('ordonnances')
           .update({
             recovered_at: recoveredAt,
@@ -112,18 +127,18 @@ router.post('/:id/recovered',
           })
           .eq('id', ordonnanceId)
           .eq('user_id', userId) // Sécurité: s'assurer que l'ordonnance appartient à l'utilisateur
-          .select('id, recovered_at');
+          .select('id');
 
-        if (error) {
+        if (updateError) {
           // Log détaillé de l'erreur
           console.error('[ORDONNANCES] update recovered failed', {
             id: ordonnanceId,
             userId: userId,
             recoveredAt: recoveredAt,
-            errorMessage: error.message,
-            errorDetails: error.details,
-            errorHint: error.hint,
-            errorCode: error.code
+            errorMessage: updateError.message,
+            errorDetails: updateError.details,
+            errorHint: updateError.hint,
+            errorCode: updateError.code
           });
 
           return res.status(500).json({
@@ -133,27 +148,71 @@ router.post('/:id/recovered',
           });
         }
 
-        // Vérifier si aucune ligne n'a été mise à jour (0 rows updated)
-        if (!data || data.length === 0) {
-          console.log(`[ORDONNANCES] ❌ Ordonnance ${ordonnanceId} non trouvée ou n'appartient pas à l'utilisateur ${userId}`);
-          return res.status(404).json({
-            ok: false,
-            error: 'NOT_FOUND',
-            message: 'Ordonnance non trouvée ou vous n\'avez pas les permissions'
+        // 2. Si l'ordonnance existe (update réussi), retourner succès
+        if (updateData && updateData.length > 0) {
+          console.log('[ORDONNANCES] recovered updated', {
+            id: ordonnanceId,
+            userId: userId,
+            recoveredAt: recoveredAt,
+            created: false
+          });
+
+          return res.status(200).json({
+            ok: true,
+            ordonnanceId: ordonnanceId,
+            recoveredAt: recoveredAt,
+            created: false
           });
         }
 
-        // Succès: log et retourner la réponse
-        console.log('[ORDONNANCES] recovered updated', {
+        // 3. Si aucune ligne n'a été mise à jour (0 rows), créer l'ordonnance à la volée
+        console.log(`[ORDONNANCES] Ordonnance ${ordonnanceId} non trouvée, création à la volée pour userId ${userId}`);
+        
+        const { data: insertData, error: insertError } = await supabase
+          .from('ordonnances')
+          .upsert({
+            id: ordonnanceId,
+            user_id: userId,
+            recovered_at: recoveredAt,
+            category: 'MEDICAMENT',
+            data: ordonnanceData,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .select('id');
+
+        if (insertError) {
+          // Log détaillé de l'erreur d'insertion
+          console.error('[ORDONNANCES] insert recovered failed', {
+            id: ordonnanceId,
+            userId: userId,
+            recoveredAt: recoveredAt,
+            errorMessage: insertError.message,
+            errorDetails: insertError.details,
+            errorHint: insertError.hint,
+            errorCode: insertError.code
+          });
+
+          return res.status(500).json({
+            ok: false,
+            error: 'DATABASE_ERROR',
+            message: 'Erreur lors de la création de l\'ordonnance'
+          });
+        }
+
+        // 4. Succès: ordonnance créée
+        console.log('[ORDONNANCES] recovered created', {
           id: ordonnanceId,
           userId: userId,
-          recoveredAt: data[0].recovered_at
+          recoveredAt: recoveredAt,
+          created: true
         });
 
         return res.status(200).json({
           ok: true,
-          ordonnanceId: data[0].id,
-          recoveredAt: data[0].recovered_at
+          ordonnanceId: ordonnanceId,
+          recoveredAt: recoveredAt,
+          created: true
         });
 
       } catch (dbError) {
