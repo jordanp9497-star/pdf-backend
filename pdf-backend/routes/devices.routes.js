@@ -5,13 +5,49 @@
  */
 
 import express from 'express';
+import { createClient } from '@supabase/supabase-js';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
+import { SUPABASE_CONFIG } from '../src/config/env.js';
 
 const router = express.Router();
 
-// Utiliser le client Supabase admin centralisé
-const supabase = supabaseAdmin;
+/**
+ * Crée un client Supabase avec le token utilisateur (pour RLS)
+ * Fallback vers service_role si le token n'est pas disponible
+ */
+function getSupabaseClient(req) {
+  const authHeader = req.headers.authorization;
+  
+  // Essayer d'utiliser le client user (RLS) si un token est présent
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7);
+    if (token && SUPABASE_CONFIG.url && process.env.SUPABASE_ANON_KEY) {
+      try {
+        // Créer un client avec anon key et passer le token dans les headers
+        const userClient = createClient(SUPABASE_CONFIG.url, process.env.SUPABASE_ANON_KEY, {
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+            detectSessionInUrl: false
+          },
+          global: {
+            headers: {
+              Authorization: `Bearer ${token}`
+            }
+          }
+        });
+        
+        return userClient;
+      } catch (error) {
+        console.warn('[DEVICES] Erreur création client user, fallback service_role:', error.message);
+      }
+    }
+  }
+  
+  // Fallback: utiliser service_role
+  return supabaseAdmin;
+}
 
 /**
  * POST /devices/heartbeat
@@ -80,9 +116,12 @@ router.post('/heartbeat',
         appVersion: appVersion || 'N/A'
       });
 
+      // Obtenir le client Supabase (user si possible, sinon service_role)
+      const supabase = getSupabaseClient(req);
+
       // Vérifier que Supabase est configuré
       if (!supabase) {
-        console.error('[DEVICES] ❌ Supabase admin client non initialisé');
+        console.error('[DEVICES] ❌ Supabase client non initialisé');
         return res.status(500).json({
           ok: false,
           error: 'DATABASE_ERROR',
@@ -91,7 +130,7 @@ router.post('/heartbeat',
       }
 
       try {
-        // Upsert l'appareil
+        // Upsert l'appareil (match sur user_id, device_id)
         const now = new Date().toISOString();
         const { data: device, error: upsertError } = await supabase
           .from('devices')
@@ -111,14 +150,28 @@ router.post('/heartbeat',
           .single();
 
         if (upsertError) {
-          console.error('[DEVICES] Error upserting device:', {
+          // Logger l'erreur Supabase complète
+          console.error('[DEVICES] Error upserting device - Supabase error complete:', {
             userId,
             deviceId,
+            errorCode: upsertError.code,
             errorMessage: upsertError.message,
             errorDetails: upsertError.details,
-            errorHint: upsertError.hint,
-            errorCode: upsertError.code
+            errorHint: upsertError.hint
           });
+
+          // Vérifier si c'est une erreur de table manquante
+          if (upsertError.code === '42P01' || // relation does not exist
+              upsertError.message?.toLowerCase().includes('relation') ||
+              upsertError.message?.toLowerCase().includes('does not exist') ||
+              upsertError.message?.toLowerCase().includes('table') && upsertError.message?.toLowerCase().includes('not found')) {
+            console.error('[DEVICES] ❌ Table devices n\'existe pas');
+            return res.status(500).json({
+              ok: false,
+              error: 'DEVICES_TABLE_MISSING',
+              message: 'La table devices n\'existe pas dans la base de données'
+            });
+          }
 
           return res.status(500).json({
             ok: false,
@@ -127,7 +180,7 @@ router.post('/heartbeat',
           });
         }
 
-        // Compter les appareils actifs de l'utilisateur (last_seen_at < 7 jours)
+        // Compter les appareils actifs de l'utilisateur (last_seen_at >= 7 jours)
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
@@ -138,7 +191,27 @@ router.post('/heartbeat',
           .gte('last_seen_at', sevenDaysAgo.toISOString());
 
         if (countError) {
-          console.error('[DEVICES] Error counting devices:', countError);
+          // Logger l'erreur Supabase complète
+          console.error('[DEVICES] Error counting devices - Supabase error complete:', {
+            userId,
+            errorCode: countError.code,
+            errorMessage: countError.message,
+            errorDetails: countError.details,
+            errorHint: countError.hint
+          });
+
+          // Vérifier si c'est une erreur de table manquante
+          if (countError.code === '42P01' || 
+              countError.message?.toLowerCase().includes('relation') ||
+              countError.message?.toLowerCase().includes('does not exist')) {
+            console.error('[DEVICES] ❌ Table devices n\'existe pas');
+            return res.status(500).json({
+              ok: false,
+              error: 'DEVICES_TABLE_MISSING',
+              message: 'La table devices n\'existe pas dans la base de données'
+            });
+          }
+
           // Ne pas bloquer la réponse, utiliser 1 comme fallback
           return res.status(200).json({
             ok: true,

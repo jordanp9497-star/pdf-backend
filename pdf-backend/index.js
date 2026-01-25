@@ -174,6 +174,11 @@ import devicesRouter from './routes/devices.routes.js';
 app.use('/devices', devicesRouter);
 console.log('[DEVICES] routes mounted (POST /devices/heartbeat)');
 
+// ===== ROUTES TREATMENTS =====
+import treatmentsRouter from './routes/treatments.routes.js';
+app.use('/treatments', treatmentsRouter);
+console.log('[TREATMENTS] routes mounted (GET /treatments/active)');
+
 // ===== ROUTES CARE (Patient <-> Aidant) =====
 import careRouter from './routes/care.routes.js';
 app.use('/care', careRouter);
@@ -5234,6 +5239,7 @@ app.use((req, res) => {
     'POST /ai/medical_summary_v2',
     'POST /ordonnances/:id/recovered',
     'POST /devices/heartbeat',
+    'GET /treatments/active',
     'POST /care/invite',
     'POST /care/accept',
     'POST /care/revoke',

@@ -118,28 +118,87 @@ router.post('/:id/recovered',
       }
 
       try {
-        // 1. Essayer d'abord de mettre à jour l'ordonnance existante
-        const { data: updateData, error: updateError } = await supabase
+        // 1. Vérifier si l'ordonnance existe déjà pour déterminer si c'est une création
+        const { data: existingOrdonnance, error: checkError } = await supabase
           .from('ordonnances')
-          .update({
-            recovered_at: recoveredAt,
-            updated_at: new Date().toISOString()
-          })
+          .select('id')
           .eq('id', ordonnanceId)
-          .eq('user_id', userId) // Sécurité: s'assurer que l'ordonnance appartient à l'utilisateur
-          .select('id');
+          .eq('user_id', userId)
+          .maybeSingle();
 
-        if (updateError) {
-          // Log détaillé de l'erreur
-          console.error('[ORDONNANCES] update recovered failed', {
-            id: ordonnanceId,
-            userId: userId,
-            recoveredAt: recoveredAt,
-            errorMessage: updateError.message,
-            errorDetails: updateError.details,
-            errorHint: updateError.hint,
-            errorCode: updateError.code
+        if (checkError) {
+          // Logger l'erreur Supabase complète
+          console.error('[ORDONNANCES] Error checking existing ordonnance - Supabase error complete:', {
+            ordonnanceId,
+            userId,
+            errorCode: checkError.code,
+            errorMessage: checkError.message,
+            errorDetails: checkError.details,
+            errorHint: checkError.hint
           });
+
+          // Vérifier si c'est une erreur de table manquante
+          if (checkError.code === '42P01' || 
+              checkError.message?.toLowerCase().includes('relation') ||
+              checkError.message?.toLowerCase().includes('does not exist') ||
+              (checkError.message?.toLowerCase().includes('table') && checkError.message?.toLowerCase().includes('not found'))) {
+            console.error('[ORDONNANCES] ❌ Table ordonnances n\'existe pas');
+            return res.status(500).json({
+              ok: false,
+              error: 'ORDONNANCES_TABLE_MISSING',
+              message: 'La table ordonnances n\'existe pas dans la base de données'
+            });
+          }
+
+          return res.status(500).json({
+            ok: false,
+            error: 'DATABASE_ERROR',
+            message: 'Erreur lors de la vérification de l\'ordonnance'
+          });
+        }
+
+        const isCreated = !existingOrdonnance;
+
+        // 2. Upsert l'ordonnance (id, user_id, recovered_at)
+        const now = new Date().toISOString();
+        const { data: upsertData, error: upsertError } = await supabase
+          .from('ordonnances')
+          .upsert({
+            id: ordonnanceId,
+            user_id: userId,
+            recovered_at: recoveredAt,
+            updated_at: now
+          }, {
+            onConflict: 'id',
+            ignoreDuplicates: false
+          })
+          .select('id, recovered_at')
+          .single();
+
+        if (upsertError) {
+          // Logger l'erreur Supabase complète
+          console.error('[ORDONNANCES] Error upserting ordonnance - Supabase error complete:', {
+            ordonnanceId,
+            userId,
+            recoveredAt,
+            errorCode: upsertError.code,
+            errorMessage: upsertError.message,
+            errorDetails: upsertError.details,
+            errorHint: upsertError.hint
+          });
+
+          // Vérifier si c'est une erreur de table manquante
+          if (upsertError.code === '42P01' || 
+              upsertError.message?.toLowerCase().includes('relation') ||
+              upsertError.message?.toLowerCase().includes('does not exist') ||
+              (upsertError.message?.toLowerCase().includes('table') && upsertError.message?.toLowerCase().includes('not found'))) {
+            console.error('[ORDONNANCES] ❌ Table ordonnances n\'existe pas');
+            return res.status(500).json({
+              ok: false,
+              error: 'ORDONNANCES_TABLE_MISSING',
+              message: 'La table ordonnances n\'existe pas dans la base de données'
+            });
+          }
 
           return res.status(500).json({
             ok: false,
@@ -148,117 +207,42 @@ router.post('/:id/recovered',
           });
         }
 
-        // 2. Si l'ordonnance existe (update réussi), créer l'audit log et retourner succès
-        if (updateData && updateData.length > 0) {
-          console.log('[ORDONNANCES] recovered updated', {
-            id: ordonnanceId,
-            userId: userId,
-            recoveredAt: recoveredAt,
-            created: false
-          });
-
-          // Créer l'audit log
-          try {
-            await supabase
-              .from('audit_log')
-              .insert({
-                actor_user_id: userId,
-                patient_user_id: userId, // Le patient est le propriétaire de l'ordonnance
-                action: 'ORDONNANCE_MARK_RECOVERED',
-                entity_type: 'ordonnance',
-                entity_id: ordonnanceId,
-                metadata: {
-                  recoveredAt: recoveredAt,
-                  created: false
-                },
-                created_at: new Date().toISOString()
-              });
-
-            console.log('[ORDONNANCES] ✅ Audit log créé pour update');
-          } catch (auditError) {
-            // Log l'erreur mais ne bloque pas la réponse
-            console.error('[ORDONNANCES] ⚠️ Erreur lors de la création de l\'audit log:', auditError);
-          }
-
-          return res.status(200).json({
-            ok: true,
-            ordonnanceId: ordonnanceId,
-            recoveredAt: recoveredAt,
-            created: false
-          });
-        }
-
-        // 3. Si aucune ligne n'a été mise à jour (0 rows), créer l'ordonnance à la volée
-        console.log(`[ORDONNANCES] Ordonnance ${ordonnanceId} non trouvée, création à la volée pour userId ${userId}`);
-        
-        const { data: insertData, error: insertError } = await supabase
-          .from('ordonnances')
-          .upsert({
-            id: ordonnanceId,
-            user_id: userId,
-            recovered_at: recoveredAt,
-            category: 'MEDICAMENT',
-            data: ordonnanceData,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          })
-          .select('id');
-
-        if (insertError) {
-          // Log détaillé de l'erreur d'insertion
-          console.error('[ORDONNANCES] insert recovered failed', {
-            id: ordonnanceId,
-            userId: userId,
-            recoveredAt: recoveredAt,
-            errorMessage: insertError.message,
-            errorDetails: insertError.details,
-            errorHint: insertError.hint,
-            errorCode: insertError.code
-          });
-
-          return res.status(500).json({
-            ok: false,
-            error: 'DATABASE_ERROR',
-            message: 'Erreur lors de la création de l\'ordonnance'
-          });
-        }
-
-        // 4. Succès: ordonnance créée, créer l'audit log et retourner succès
-        console.log('[ORDONNANCES] recovered created', {
-          id: ordonnanceId,
-          userId: userId,
-          recoveredAt: recoveredAt,
-          created: true
-        });
-
-        // Créer l'audit log
+        // 3. Créer l'audit log
         try {
           await supabase
             .from('audit_log')
             .insert({
               actor_user_id: userId,
-              patient_user_id: userId, // Le patient est le propriétaire de l'ordonnance
+              patient_user_id: userId,
               action: 'ORDONNANCE_MARK_RECOVERED',
               entity_type: 'ordonnance',
               entity_id: ordonnanceId,
               metadata: {
                 recoveredAt: recoveredAt,
-                created: true
+                created: isCreated
               },
-              created_at: new Date().toISOString()
+              created_at: now
             });
 
-          console.log('[ORDONNANCES] ✅ Audit log créé pour création');
+          console.log(`[ORDONNANCES] ✅ Audit log créé (created: ${isCreated})`);
         } catch (auditError) {
           // Log l'erreur mais ne bloque pas la réponse
           console.error('[ORDONNANCES] ⚠️ Erreur lors de la création de l\'audit log:', auditError);
         }
 
+        // 4. Retourner succès
+        console.log(`[ORDONNANCES] ✅ Ordonnance ${isCreated ? 'créée' : 'mise à jour'}`, {
+          ordonnanceId,
+          userId,
+          recoveredAt,
+          created: isCreated
+        });
+
         return res.status(200).json({
           ok: true,
           ordonnanceId: ordonnanceId,
           recoveredAt: recoveredAt,
-          created: true
+          created: isCreated
         });
 
       } catch (dbError) {
