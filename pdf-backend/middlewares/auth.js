@@ -2,15 +2,25 @@
  * Middleware d'authentification Supabase robuste
  * 
  * Vérifie le token JWT dans le header Authorization: Bearer <token>
- * et définit req.user = { id } et req.userId = user.id si le token est valide
+ * et définit req.userId = user.id et req.user = user si le token est valide
  * 
  * Utilise SUPABASE_URL et SUPABASE_ANON_KEY depuis process.env
+ * IMPORTANT: SUPABASE_URL doit être du même projet que le token (iss)
+ * Format attendu: https://paspjmhyndqnatsmcjtu.supabase.co (sans /auth/v1)
  */
 
 import { createClient } from '@supabase/supabase-js';
 
+// Nettoyer SUPABASE_URL (enlever /auth/v1 si présent)
+function cleanSupabaseUrl(url) {
+  if (!url) return null;
+  // Enlever /auth/v1 ou tout autre suffixe de chemin
+  return url.replace(/\/auth\/v1\/?$/, '').replace(/\/$/, '');
+}
+
 // Initialiser le client Supabase (lecture seule pour vérifier les tokens)
-const supabaseUrl = process.env.SUPABASE_URL;
+const rawSupabaseUrl = process.env.SUPABASE_URL;
+const supabaseUrl = rawSupabaseUrl ? cleanSupabaseUrl(rawSupabaseUrl) : null;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
@@ -21,7 +31,13 @@ if (!supabaseUrl || !supabaseAnonKey) {
 }
 
 const supabase = supabaseUrl && supabaseAnonKey 
-  ? createClient(supabaseUrl, supabaseAnonKey)
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false
+      }
+    })
   : null;
 
 if (supabase) {
@@ -57,7 +73,7 @@ export const authenticateSupabase = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     
     if (!authHeader) {
-      console.log('[AUTH] Missing Authorization header');
+      console.log('[AUTH] Missing/invalid Authorization header');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -68,7 +84,7 @@ export const authenticateSupabase = async (req, res, next) => {
     // Vérifier le format "Bearer <token>"
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') {
-      console.log('[AUTH] Invalid Authorization format (expected: Bearer <token>)');
+      console.log('[AUTH] Missing/invalid Authorization header');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -79,7 +95,7 @@ export const authenticateSupabase = async (req, res, next) => {
     const token = parts[1];
 
     if (!token || token.trim() === '') {
-      console.log('[AUTH] Token missing after Bearer');
+      console.log('[AUTH] Missing/invalid Authorization header');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -88,13 +104,13 @@ export const authenticateSupabase = async (req, res, next) => {
     }
 
     // Log DEBUG: token reçu (longueur seulement)
-    console.log(`[AUTH] Token received (len=${token.length})`);
+    console.log(`[AUTH] Token received len=${token.length}`);
 
     // Vérifier le token avec Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
 
     if (error) {
-      console.error('[AUTH] ❌ Error during getUser:', error.message);
+      console.log(`[AUTH] getUser failed: ${error.message}`);
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -103,7 +119,7 @@ export const authenticateSupabase = async (req, res, next) => {
     }
 
     if (!user) {
-      console.log('[AUTH] ❌ User not found (token invalid or expired)');
+      console.log('[AUTH] getUser failed: User not found (token invalid or expired)');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -111,14 +127,12 @@ export const authenticateSupabase = async (req, res, next) => {
       });
     }
 
-    // Définir req.user et req.userId
-    req.user = {
-      id: user.id
-    };
+    // Définir req.userId et req.user (objet user complet)
     req.userId = user.id;
+    req.user = user;
 
     // Log DEBUG: utilisateur authentifié
-    console.log(`[AUTH] ✅ User authenticated: ${user.id}`);
+    console.log(`[AUTH] OK userId=${user.id}`);
     next();
 
   } catch (error) {
