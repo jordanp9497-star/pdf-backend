@@ -1,8 +1,10 @@
 /**
- * Middleware d'authentification Supabase
+ * Middleware d'authentification Supabase robuste
  * 
  * Vérifie le token JWT dans le header Authorization: Bearer <token>
- * et définit req.user = { id } si le token est valide
+ * et définit req.user = { id } et req.userId = user.id si le token est valide
+ * 
+ * Utilise SUPABASE_URL et SUPABASE_ANON_KEY depuis process.env
  */
 
 import { createClient } from '@supabase/supabase-js';
@@ -13,6 +15,8 @@ const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
   console.warn('[AUTH] ⚠️ Variables SUPABASE_URL ou SUPABASE_ANON_KEY non définies');
+  console.warn('[AUTH] ⚠️ SUPABASE_URL:', supabaseUrl ? '✅ présent' : '❌ absent');
+  console.warn('[AUTH] ⚠️ SUPABASE_ANON_KEY:', supabaseAnonKey ? '✅ présent' : '❌ absent');
   console.warn('[AUTH] L\'authentification Supabase ne fonctionnera pas');
 }
 
@@ -20,12 +24,17 @@ const supabase = supabaseUrl && supabaseAnonKey
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
 
+if (supabase) {
+  console.log('[AUTH] ✅ Client Supabase initialisé pour l\'authentification');
+  console.log('[AUTH] SUPABASE_URL:', supabaseUrl);
+}
+
 /**
  * Middleware pour vérifier l'authentification Supabase
  * 
  * Extrait le token du header Authorization: Bearer <token>
  * Vérifie le token avec Supabase
- * Définit req.user = { id } si valide
+ * Définit req.user = { id } et req.userId = user.id si valide
  * 
  * Usage:
  *   app.use('/api', authenticateSupabase);
@@ -34,61 +43,82 @@ const supabase = supabaseUrl && supabaseAnonKey
  */
 export const authenticateSupabase = async (req, res, next) => {
   try {
-    // Si Supabase n'est pas configuré, passer sans authentification
+    // Si Supabase n'est pas configuré, refuser l'accès
     if (!supabase) {
-      console.warn('[AUTH] Supabase non configuré, authentification ignorée');
-      return next();
+      console.error('[AUTH] ❌ Supabase non configuré, authentification impossible');
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise'
+      });
     }
 
     // Extraire le token du header Authorization
     const authHeader = req.headers.authorization;
     
     if (!authHeader) {
+      console.log('[AUTH] Missing Authorization header');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
-        message: 'Token d\'authentification manquant'
+        message: 'Authentification requise'
       });
     }
 
     // Vérifier le format "Bearer <token>"
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') {
+      console.log('[AUTH] Invalid Authorization format (expected: Bearer <token>)');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
-        message: 'Format du token invalide. Utilisez: Authorization: Bearer <token>'
+        message: 'Authentification requise'
       });
     }
 
     const token = parts[1];
 
-    if (!token) {
+    if (!token || token.trim() === '') {
+      console.log('[AUTH] Token missing after Bearer');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
-        message: 'Token manquant'
+        message: 'Authentification requise'
       });
     }
+
+    // Log DEBUG: token reçu (longueur seulement)
+    console.log(`[AUTH] Token received (len=${token.length})`);
 
     // Vérifier le token avec Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
 
-    if (error || !user) {
-      console.log(`[AUTH] ❌ Token invalide: ${error?.message || 'User not found'}`);
+    if (error) {
+      console.error('[AUTH] ❌ Error during getUser:', error.message);
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
-        message: 'Token invalide ou expiré'
+        message: 'Authentification requise'
       });
     }
 
-    // Définir req.user avec l'ID de l'utilisateur
+    if (!user) {
+      console.log('[AUTH] ❌ User not found (token invalid or expired)');
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise'
+      });
+    }
+
+    // Définir req.user et req.userId
     req.user = {
       id: user.id
     };
+    req.userId = user.id;
 
-    console.log(`[AUTH] ✅ Utilisateur authentifié: ${user.id}`);
+    // Log DEBUG: utilisateur authentifié
+    console.log(`[AUTH] ✅ User authenticated: ${user.id}`);
     next();
 
   } catch (error) {
