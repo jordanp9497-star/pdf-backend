@@ -45,6 +45,7 @@ import pdfParse from 'pdf-parse';
 import { randomUUID, createHmac, createHash } from 'crypto';
 import OpenAI from 'openai';
 import { APP_CONFIG } from './src/config/env.js';
+import { supabaseAdmin } from './src/lib/supabaseAdmin.js';
 
 const app = express();
 const PORT = APP_CONFIG.port;
@@ -178,6 +179,11 @@ console.log('[DEVICES] routes mounted (POST /devices/heartbeat)');
 import treatmentsRouter from './routes/treatments.routes.js';
 app.use('/treatments', treatmentsRouter);
 console.log('[TREATMENTS] routes mounted (GET /treatments/active)');
+
+// ===== ROUTES SUPPLEMENTS =====
+import supplementsRouter from './routes/supplements.routes.js';
+app.use('/supplements', supplementsRouter);
+console.log('[SUPPLEMENTS] routes mounted (GET /supplements, POST /supplements, PATCH /supplements/:id, DELETE /supplements/:id)');
 
 // ===== ROUTES CARE (Patient <-> Aidant) =====
 import careRouter from './routes/care.routes.js';
@@ -3433,6 +3439,115 @@ const aiSummaryHandler = async (req, res) => {
   }
 };
 
+/**
+ * Formate un complément alimentaire pour le résumé médical
+ * 
+ * @param {Object} supplement - Complément à formater
+ * @returns {string} - Texte formaté pour le résumé
+ */
+function formatSupplementForSummary(supplement) {
+  const parts = [];
+  
+  // Nom (title)
+  if (supplement.title) {
+    parts.push(supplement.title);
+  }
+  
+  // Fréquence (schedule)
+  if (supplement.schedule && typeof supplement.schedule === 'object') {
+    const schedule = supplement.schedule;
+    const freqParts = [];
+    
+    if (schedule.mode === 'daily') {
+      freqParts.push('quotidien');
+    } else if (schedule.mode === 'weekly') {
+      const days = schedule.daysOfWeek || [];
+      const dayNames = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+      const dayLabels = days.map(d => dayNames[d]).filter(Boolean);
+      if (dayLabels.length > 0) {
+        freqParts.push(`hebdomadaire (${dayLabels.join(', ')})`);
+      } else {
+        freqParts.push('hebdomadaire');
+      }
+    } else if (schedule.mode === 'monthly') {
+      freqParts.push(`mensuel (jour ${schedule.dayOfMonth || '?'})`);
+    }
+    
+    if (schedule.times && Array.isArray(schedule.times) && schedule.times.length > 0) {
+      freqParts.push(`à ${schedule.times.join(', ')}`);
+    }
+    
+    if (freqParts.length > 0) {
+      parts.push(`Fréquence: ${freqParts.join(' ')}`);
+    }
+  }
+  
+  // Période (start_date -> end_date)
+  if (supplement.start_date || supplement.end_date) {
+    const periodParts = [];
+    if (supplement.start_date) {
+      const startDate = new Date(supplement.start_date);
+      if (!isNaN(startDate.getTime())) {
+        periodParts.push(`depuis ${startDate.toLocaleDateString('fr-FR')}`);
+      }
+    }
+    if (supplement.end_date) {
+      const endDate = new Date(supplement.end_date);
+      if (!isNaN(endDate.getTime())) {
+        periodParts.push(`jusqu'au ${endDate.toLocaleDateString('fr-FR')}`);
+      }
+    }
+    if (periodParts.length > 0) {
+      parts.push(`Période: ${periodParts.join(' ')}`);
+    }
+  }
+  
+  // Notes
+  if (supplement.notes && supplement.notes.trim()) {
+    parts.push(`Notes: ${supplement.notes.trim()}`);
+  }
+  
+  return parts.length > 0 ? parts.join(' | ') : supplement.title || 'Complément';
+}
+
+/**
+ * Récupère les compléments actifs pour un profile_id
+ * 
+ * @param {string} userId - ID de l'utilisateur
+ * @param {string} profileId - ID du profil (optionnel)
+ * @returns {Promise<Array>} - Liste des compléments
+ */
+async function fetchActiveSupplements(userId, profileId) {
+  if (!supabaseAdmin) {
+    console.warn('[AI_SUMMARY_V2] Supabase admin non disponible, skip compléments');
+    return [];
+  }
+  
+  try {
+    let query = supabaseAdmin
+      .from('supplements')
+      .select('*')
+      .eq('owner_user_id', userId)
+      .in('status', ['active', 'paused']); // Actifs et paused
+    
+    if (profileId) {
+      query = query.eq('profile_id', profileId);
+    }
+    
+    const { data: supplements, error } = await query;
+    
+    if (error) {
+      console.warn('[AI_SUMMARY_V2] Erreur récupération compléments:', error.message);
+      return [];
+    }
+    
+    return supplements || [];
+  } catch (error) {
+    console.warn('[AI_SUMMARY_V2] Erreur récupération compléments:', error.message);
+    return [];
+  }
+}
+
 // ===== AI MEDICAL SUMMARY V2 HANDLER (hoistée pour éviter TDZ) =====
 async function aiSummaryV2Handler(req, res) {
   console.log('[AI_SUMMARY_V2] HIT', req.method, req.originalUrl);
@@ -3447,6 +3562,10 @@ async function aiSummaryV2Handler(req, res) {
     const personal = req.body.personal;
     const ordonnances = req.body.ordonnances;
     const healthProfile = req.body.healthProfile; // Optionnel
+    const profileId = req.body.profile_id || req.query.profile_id; // Optionnel
+    
+    // Récupérer l'utilisateur si authentifié (pour récupérer les compléments)
+    const userId = req.userId || req.user?.id;
     
     // Sécurité: ne pas logger healthProfile en clair
     const healthProfileHash = healthProfile 
@@ -3456,10 +3575,29 @@ async function aiSummaryV2Handler(req, res) {
       console.log(`[AI_SUMMARY_V2] healthProfile reçu (hash: ${healthProfileHash})`);
     }
     
-    // IMPORTANT: Si un cache est implémenté, la clé doit inclure healthProfile pour éviter un mauvais cache
-    // Exemple de cacheKey: userId + ":" + hash(ordonnances) + ":" + (healthProfile.updatedAt || hash(healthProfile))
-    // Cela garantit que le résumé se régénère si le HealthProfile change
-    // const cacheKey = `${userId}:${hashOrdonnances}:${healthProfile?.updatedAt || hashHealthProfile}`;
+    // Récupérer les compléments alimentaires actifs si userId et profileId disponibles
+    let supplements = [];
+    if (userId && profileId) {
+      try {
+        supplements = await fetchActiveSupplements(userId, profileId);
+        console.log(`[AI_SUMMARY_V2] ${supplements.length} complément(s) récupéré(s) pour profile_id=${profileId}`);
+      } catch (suppError) {
+        console.warn('[AI_SUMMARY_V2] Erreur récupération compléments (non bloquant):', suppError.message);
+        supplements = [];
+      }
+    } else {
+      if (!userId) {
+        console.log('[AI_SUMMARY_V2] userId non disponible, skip compléments');
+      }
+      if (!profileId) {
+        console.log('[AI_SUMMARY_V2] profile_id non fourni, skip compléments');
+      }
+    }
+    
+    // IMPORTANT: Si un cache est implémenté, la clé doit inclure healthProfile et supplements pour éviter un mauvais cache
+    // Exemple de cacheKey: userId + ":" + hash(ordonnances) + ":" + (healthProfile.updatedAt || hash(healthProfile)) + ":" + hash(supplements)
+    // Cela garantit que le résumé se régénère si le HealthProfile ou les compléments changent
+    // const cacheKey = `${userId}:${hashOrdonnances}:${healthProfile?.updatedAt || hashHealthProfile}:${hashSupplements}`;
     
     // Construire factsText pour OpenAI (SANS identité)
     const factsParts = [];
@@ -3635,6 +3773,18 @@ async function aiSummaryV2Handler(req, res) {
       });
     }
     
+    // Ajouter les compléments alimentaires
+    if (supplements && supplements.length > 0) {
+      factsParts.push('\n=== COMPLÉMENTS ALIMENTAIRES ===');
+      supplements.forEach(supp => {
+        const formatted = formatSupplementForSummary(supp);
+        factsParts.push(`- ${formatted}`);
+      });
+    } else {
+      factsParts.push('\n=== COMPLÉMENTS ALIMENTAIRES ===');
+      factsParts.push('Aucun');
+    }
+    
     const factsText = factsParts.join('\n');
     
     // Générer le résumé fallback (toujours disponible) - SANS identité
@@ -3685,6 +3835,14 @@ async function aiSummaryV2Handler(req, res) {
       fallbackParts.push(`Allergies: ${personal.allergies.join(', ')}`);
     }
     
+    // Ajouter les compléments dans le fallback
+    if (supplements && supplements.length > 0) {
+      const suppTexts = supplements.map(supp => formatSupplementForSummary(supp));
+      fallbackParts.push(`Compléments alimentaires: ${suppTexts.join(' ; ')}`);
+    } else {
+      fallbackParts.push('Compléments alimentaires: Aucun');
+    }
+    
     let fallbackSummary = fallbackParts.join(' ; ');
     if (!fallbackSummary || fallbackSummary.trim().length === 0) {
       fallbackSummary = 'Aucune information médicale disponible.';
@@ -3709,10 +3867,12 @@ RÈGLES STRICTES:
 - Structure la réponse en sections recommandées:
   * "Antécédents & allergies"
   * "Traitements en cours"
+  * "Compléments alimentaires"
   * "Rendez-vous & examens"
   * "Points d'attention"
 - Utilise uniquement les informations présentes dans le contexte fourni.
-- Si une information n'est pas dans le contexte, ne l'invente pas.`;
+- Si une information n'est pas dans le contexte, ne l'invente pas.
+- Pour la section "Compléments alimentaires", utilise les informations de la section "COMPLÉMENTS ALIMENTAIRES" du contexte. Si cette section indique "Aucun", indique "Aucun complément alimentaire".`;
         
         if (healthProfile) {
           systemPrompt += `\n\nIMPORTANT: La section "CONTEXTE DÉCLARÉ PAR L'UTILISATEUR (HEALTHPROFILE)" contient des informations déclaratives fournies par l'utilisateur. Ce sont des informations déclaratives, ne pas inférer. Utilise-les uniquement si elles sont présentes dans cette section.`;
