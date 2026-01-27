@@ -62,6 +62,7 @@ export const authenticateSupabase = async (req, res, next) => {
     // Si Supabase n'est pas configuré, refuser l'accès
     if (!supabase) {
       console.error('[AUTH] ❌ Supabase non configuré, authentification impossible');
+      console.error('[AUTH] Vérifiez que SUPABASE_URL et SUPABASE_ANON_KEY sont définis dans les variables d\'environnement');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -73,7 +74,7 @@ export const authenticateSupabase = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     
     if (!authHeader) {
-      console.log('[AUTH] Missing/invalid Authorization header');
+      console.log('[AUTH] missing token');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -84,7 +85,7 @@ export const authenticateSupabase = async (req, res, next) => {
     // Vérifier le format "Bearer <token>"
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') {
-      console.log('[AUTH] Missing/invalid Authorization header');
+      console.log('[AUTH] missing token (format invalide: doit être "Bearer <token>")');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -95,7 +96,7 @@ export const authenticateSupabase = async (req, res, next) => {
     const token = parts[1];
 
     if (!token || token.trim() === '') {
-      console.log('[AUTH] Missing/invalid Authorization header');
+      console.log('[AUTH] missing token (token vide)');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -103,14 +104,11 @@ export const authenticateSupabase = async (req, res, next) => {
       });
     }
 
-    // Log DEBUG: token reçu (longueur seulement)
-    console.log(`[AUTH] Token received len=${token.length}`);
-
     // Vérifier le token avec Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
 
     if (error) {
-      console.log(`[AUTH] getUser failed: ${error.message}`);
+      console.log(`[AUTH] invalid token: ${error.message}`);
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -119,7 +117,7 @@ export const authenticateSupabase = async (req, res, next) => {
     }
 
     if (!user) {
-      console.log('[AUTH] getUser failed: User not found (token invalid or expired)');
+      console.log('[AUTH] invalid token (user not found)');
       return res.status(401).json({
         ok: false,
         error: 'UNAUTHORIZED',
@@ -131,8 +129,8 @@ export const authenticateSupabase = async (req, res, next) => {
     req.userId = user.id;
     req.user = user;
 
-    // Log DEBUG: utilisateur authentifié
-    console.log(`[AUTH] OK userId=${user.id}`);
+    // Log succès: userId récupéré
+    console.log(`[AUTH] userId=${user.id}`);
     next();
 
   } catch (error) {

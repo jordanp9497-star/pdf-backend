@@ -24,16 +24,22 @@ SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
 - ✅ Correct : `https://paspjmhyndqnatsmcjtu.supabase.co`
 - ❌ Incorrect : `https://paspjmhyndqnatsmcjtu.supabase.co/auth/v1`
 
-### Variables d'authentification (requises)
+### Variables d'authentification (requises pour POST /billing/create-checkout-session)
 
 ```bash
 SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 ```
 
+**⚠️ CRITIQUE pour l'authentification :** Cette variable est **OBLIGATOIRE** pour que l'endpoint `/billing/create-checkout-session` fonctionne.
+
 **Où trouver SUPABASE_ANON_KEY ?**
 
-1. Même endroit : **Settings > API** dans Supabase
-2. Copiez la clé **anon/public** (celle qui commence par `eyJ...`)
+1. Allez sur votre projet Supabase : https://supabase.com/dashboard
+2. Sélectionnez votre projet
+3. Allez dans **Settings > API**
+4. Copiez la clé **anon/public** (celle qui commence par `eyJ...`)
+   - C'est la clé publique, différente de la clé service_role
+   - Elle est utilisée par le middleware `authenticateSupabase` pour valider les tokens JWT
 
 ### Autres variables (déjà configurées)
 
