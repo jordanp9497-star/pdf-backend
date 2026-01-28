@@ -106,6 +106,12 @@ try {
   // Les requireEnv() ci-dessus vont throw si manquantes
   console.log('[ENV] ✅ Toutes les variables d\'environnement requises sont présentes');
 } catch (error) {
-  console.error('[ENV] ❌ Erreur de configuration:', error instanceof Error ? error.message : error);
+  const msg = error instanceof Error ? error.message : String(error);
+  if (msg.includes('SUPABASE_URL') || msg.includes('SUPABASE_SERVICE_ROLE_KEY')) {
+    throw new Error(
+      'Démarrage impossible: SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis (Storage, auth). Vérifiez vos variables d\'environnement.'
+    );
+  }
+  console.error('[ENV] ❌ Erreur de configuration:', msg);
   throw error;
 }

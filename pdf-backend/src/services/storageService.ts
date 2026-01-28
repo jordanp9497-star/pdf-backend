@@ -1,7 +1,8 @@
 /**
  * Service de stockage Supabase (PDFs / images bruts)
  *
- * Utilise le client Supabase avec SERVICE_ROLE_KEY (upload + signed URLs).
+ * Utilise UNIQUEMENT le client Supabase admin (SUPABASE_SERVICE_ROLE_KEY), pas la clé anon.
+ * Upload et signed URLs passent par supabaseAdmin => SERVICE_ROLE_KEY.
  * Convention de path: prescriptions/<userId>/<profileId>/<prescriptionId>/<filename>
  * (bucket = "prescriptions", path = "<userId>/<profileId>/<prescriptionId>/<filename>").
  */
@@ -9,6 +10,46 @@
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 
 const isDev = process.env.NODE_ENV !== 'production';
+
+/**
+ * Vérifie que le bucket existe ; le crée si absent (nécessite SERVICE_ROLE_KEY).
+ * À appeler au boot ou avant le premier upload.
+ */
+export async function ensureBucketExists(bucketName: string): Promise<void> {
+  const { data: buckets, error: listError } = await supabaseAdmin.storage.listBuckets();
+
+  if (listError) {
+    if (isDev) {
+      console.log('[STORAGE] listBuckets error', listError.message);
+    }
+    throw listError;
+  }
+
+  const exists = Array.isArray(buckets) && buckets.some((b) => (b as { name?: string }).name === bucketName);
+  if (exists) {
+    if (isDev) {
+      console.log('[STORAGE] bucket exists', bucketName);
+    }
+    return;
+  }
+
+  const { error: createError } = await supabaseAdmin.storage.createBucket(bucketName, { public: false });
+  if (createError) {
+    if (isDev) {
+      console.log('[STORAGE] createBucket error', bucketName, createError.message);
+    }
+    throw createError;
+  }
+  console.log('[STORAGE] bucket created', bucketName);
+}
+
+/**
+ * Retourne true si l'erreur Storage indique "bucket non trouvé".
+ */
+export function isBucketNotFoundError(err: unknown): boolean {
+  const msg = String((err as Error & { message?: string })?.message ?? '').toLowerCase();
+  return msg.includes('bucket') && (msg.includes('not found') || msg.includes('not exist') || msg.includes('missing'));
+}
 
 export type UploadBufferOptions = {
   bucket: string;
@@ -75,9 +116,31 @@ export async function createSignedUrl(options: CreateSignedUrlOptions): Promise<
 }
 
 /**
+ * Corrige ".pdf.pdf" en ".pdf" et nettoie les caractères dangereux (espaces, accents, slash).
+ * À utiliser pour original_name en DB (affichage).
+ */
+export function normalizeOriginalFilename(originalName: string): string {
+  let name = originalName.trim() || 'document.pdf';
+  if (name.toLowerCase().endsWith('.pdf.pdf')) {
+    name = name.slice(0, -4);
+  }
+  name = name.normalize('NFD').replace(/\p{Mark}/gu, '');
+  name = name.replace(/[\s/\\]+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_');
+  return name || 'document.pdf';
+}
+
+/**
+ * Retourne un nom de fichier unique pour le Storage : `${Date.now()}-${random}.pdf`
+ */
+export function getUniqueStorageFilename(): string {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${Date.now()}-${random}.pdf`;
+}
+
+/**
  * Construit le path Storage pour une ordonnance (convention).
  * Format: <userId>/<profileId>/<prescriptionId>/<filename>
- * Bucket attendu: "prescriptions"
+ * Préférer getUniqueStorageFilename() pour le segment filename.
  */
 export function buildPrescriptionStoragePath(
   userId: string,

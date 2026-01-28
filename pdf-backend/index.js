@@ -6,6 +6,13 @@ import { logEnvStatus } from './src/config/env.js';
 console.log("✅ BOOT SIGNATURE __BUILD_CHECK");
 console.log("🚀 Backend started");
 
+// Crash au démarrage si Supabase manquant (Storage / auth)
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error(
+    'Démarrage impossible: SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis. Définissez-les dans vos variables d\'environnement.'
+  );
+}
+
 // Logs sécurisés des variables d'environnement
 logEnvStatus();
 
@@ -47,6 +54,7 @@ import OpenAI from 'openai';
 import PQueue from 'p-queue';
 import { APP_CONFIG } from './src/config/env.js';
 import { supabaseAdmin } from './src/lib/supabaseAdmin.js';
+import { ensureBucketExists } from './src/services/storageService.js';
 
 const app = express();
 const PORT = APP_CONFIG.port;
@@ -5895,16 +5903,21 @@ app.use((req, res) => {
   });
 });
 
-// Démarrage du serveur
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`✅ Serveur démarré sur http://localhost:${PORT}`);
-  console.log(`[APP] Base URL: ${APP_CONFIG.baseUrl}`);
-  
-  // Lister les routes montées
-  try {
-    logRegisteredRoutes();
-  } catch (err) {
-    console.warn('⚠️ Impossible de lister les routes:', err.message);
-  }
-});
+// Démarrage du serveur (après vérification du bucket Storage "prescriptions")
+ensureBucketExists('prescriptions')
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+      console.log(`✅ Serveur démarré sur http://localhost:${PORT}`);
+      console.log(`[APP] Base URL: ${APP_CONFIG.baseUrl}`);
+      try {
+        logRegisteredRoutes();
+      } catch (err) {
+        console.warn('⚠️ Impossible de lister les routes:', err.message);
+      }
+    });
+  })
+  .catch((err) => {
+    console.error('[BOOT] Bucket Storage "prescriptions" introuvable et création échouée:', err?.message ?? err);
+    process.exit(1);
+  });

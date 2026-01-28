@@ -19,6 +19,9 @@ import {
   uploadBufferToStorage,
   buildPrescriptionStoragePath,
   createSignedUrl,
+  isBucketNotFoundError,
+  normalizeOriginalFilename,
+  getUniqueStorageFilename,
 } from '../services/storageService.js';
 import { structurizePrescriptionText } from '../services/prescriptionStructService.js';
 import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
@@ -191,9 +194,16 @@ router.post(
   requireUser,
   uploadImportPdf.single('file'),
   async (req: Request, res: Response) => {
+    const traceId = randomUUID();
     type ReqWithUser = Request & { userId?: string };
     const reqUser = req as ReqWithUser;
     const userId = reqUser.userId;
+
+    console.log('[PRESCRIPTIONS] import-pdf', {
+      traceId,
+      userId: userId ?? null,
+      bodyKeys: Object.keys(req.body || {}),
+    });
 
     if (!userId) {
       return res.status(401).json({
@@ -203,9 +213,6 @@ router.post(
       });
     }
 
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('[PRESCRIPTIONS] import-pdf body keys', Object.keys(req.body || {}));
-    }
     const rawProfileId = req.body?.profile_id ?? req.body?.profileId ?? req.query?.profile_id;
     const profileId = typeof rawProfileId === 'string' ? rawProfileId.trim() : '';
     if (!profileId) {
@@ -224,31 +231,55 @@ router.post(
       });
     }
 
+    console.log('[PRESCRIPTIONS] import-pdf file', {
+      traceId,
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: (req.file.buffer as Buffer).length,
+    });
+
     const buffer = req.file.buffer as Buffer;
     const contentType = req.file.mimetype || 'application/octet-stream';
     const size = buffer.length;
-    const originalName = req.file.originalname || 'document.pdf';
+    const originalNameForDb = normalizeOriginalFilename(req.file.originalname || 'document.pdf');
+    const storageFilename = getUniqueStorageFilename();
     const prescriptionId = randomUUID();
 
+    const storagePath = buildPrescriptionStoragePath(
+      userId,
+      profileId,
+      prescriptionId,
+      storageFilename
+    );
+    console.log('[PRESCRIPTIONS] import-pdf storage upload', { traceId, bucket: BUCKET, path: storagePath });
+
     try {
-      const storagePath = buildPrescriptionStoragePath(
-        userId,
-        profileId,
-        prescriptionId,
-        originalName
-      );
       await uploadBufferToStorage({
         bucket: BUCKET,
         path: storagePath,
         buffer,
         contentType,
       });
-    } catch (storageErr) {
-      console.error('[PRESCRIPTIONS] import-pdf storage upload:', storageErr);
+    } catch (storageErr: unknown) {
+      const err = storageErr as Error & { message?: string; code?: string; statusCode?: number };
+      console.error('[PRESCRIPTIONS] import-pdf storage upload failed', { traceId, error: err });
+      if (isBucketNotFoundError(storageErr)) {
+        return res.status(500).json({
+          ok: false,
+          error: 'BUCKET_NOT_FOUND',
+          message: 'Le bucket Storage "prescriptions" est introuvable. Créez-le dans le dashboard Supabase ou vérifiez la config.',
+          details: err?.message ?? null,
+        });
+      }
+      const details =
+        err instanceof Error
+          ? { message: err.message, name: err.name, ...(err as Record<string, unknown>) }
+          : (storageErr as Record<string, unknown>);
       return res.status(500).json({
         ok: false,
-        error: 'STORAGE_ERROR',
-        message: 'Erreur lors de l\'upload du fichier',
+        error: 'STORAGE_UPLOAD_FAILED',
+        message: err?.message ?? 'Upload Storage échoué',
+        details,
       });
     }
 
@@ -314,10 +345,10 @@ router.post(
     const { error: fileError } = await supabaseAdmin.from('prescription_files').insert({
       prescription_id: prescriptionId,
       bucket: BUCKET,
-      path: buildPrescriptionStoragePath(userId, profileId, prescriptionId, originalName),
+      path: storagePath,
       mime_type: contentType,
       size,
-      original_name: originalName,
+      original_name: originalNameForDb,
     });
 
     if (fileError) {
