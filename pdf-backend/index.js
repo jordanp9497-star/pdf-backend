@@ -572,31 +572,85 @@ app.post('/analyze-ordonnance-test', (req, res) => {
 });
 
 // Route POST /analyze-ordonnance
+// Expect multipart field: file
 app.post('/analyze-ordonnance', upload.single('file'), async (req, res) => {
+  const traceId = randomUUID();
+  console.log(`[ANALYZE_ORDONNANCE][${traceId}] Début de l'analyse`);
+
   try {
-    // 1. Vérifier qu'un fichier a été uploadé
+    // ===== VALIDATIONS AVANT ANALYSE =====
+    
+    // 1. Validation: fichier requis
     if (!req.file) {
-      return res.status(400).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Fichier manquant`);
+      return res.status(400).json({
+        ok: false,
+        error: 'MISSING_FILE',
+        traceId
+      });
     }
 
-    // 2. Vérifier que c'est bien un PDF
+    // 2. Validation: fichier non vide
+    if (req.file.size === 0) {
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Fichier vide (size=0)`);
+      return res.status(400).json({
+        ok: false,
+        error: 'EMPTY_FILE',
+        traceId
+      });
+    }
+
+    // 3. Validation: profile_id requis
+    const profileId = req.body?.profile_id || req.query?.profile_id;
+    if (!profileId || (typeof profileId === 'string' && profileId.trim() === '')) {
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ profile_id manquant`);
+      return res.status(400).json({
+        ok: false,
+        error: 'MISSING_PROFILE_ID',
+        traceId
+      });
+    }
+
+    // ===== LOGS SERVEUR DÉTAILLÉS =====
+    console.log(`[ANALYZE_ORDONNANCE][${traceId}] Content-Type: ${req.headers['content-type'] || 'non défini'}`);
+    console.log(`[ANALYZE_ORDONNANCE][${traceId}] Fichier: originalname="${req.file.originalname}", mimetype="${req.file.mimetype}", size=${req.file.size} bytes`);
+    console.log(`[ANALYZE_ORDONNANCE][${traceId}] profile_id: ${profileId}`);
+
+    // 4. Validation: type PDF
     if (req.file.mimetype !== 'application/pdf') {
-      return res.status(400).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Type de fichier invalide: ${req.file.mimetype}`);
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_FILE_TYPE',
+        message: 'Type de fichier invalide (PDF requis)',
+        traceId
+      });
     }
 
-    // 3. Extraire le texte du PDF
+    // 5. Extraire le texte du PDF
     let extractedText;
     try {
       const pdfData = await pdfParse(req.file.buffer);
       extractedText = pdfData.text.trim();
     } catch (error) {
-      console.error('Erreur lors de l\'extraction PDF:', error);
-      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Erreur extraction PDF:`, error?.stack || error);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: error?.message || 'Erreur lors de l\'extraction PDF',
+        traceId
+      });
     }
 
-    // 4. Vérifier que du texte a été extrait
+    // 6. Validation: texte extrait non vide
     if (!extractedText || extractedText.length === 0) {
-      return res.status(400).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Aucun texte extrait du PDF`);
+      return res.status(400).json({
+        ok: false,
+        error: 'EMPTY_EXTRACTED_TEXT',
+        message: 'Aucun texte extrait du PDF',
+        traceId
+      });
     }
 
     // Log du texte brut extrait du PDF
@@ -604,70 +658,106 @@ app.post('/analyze-ordonnance', upload.single('file'), async (req, res) => {
     console.log(extractedText);
     console.log("==========================");
 
-    // 5. Structurer le texte en sections médicales explicites
+    // 6. Structurer le texte en sections médicales explicites
     const structuredText = structureText(extractedText);
     console.log("===== TEXTE STRUCTURÉ =====");
     console.log(structuredText);
     console.log("============================");
 
-    // 6. Appeler le webhook n8n avec le texte structuré
-    const n8nData = {
-      text: structuredText
-    };
-
+    // 7. Appeler le webhook n8n (provider OCR/LLM)
+    const n8nData = { text: structuredText };
     let n8nResponse;
     try {
       n8nResponse = await fetch(N8N_WEBHOOK_URL, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(n8nData)
       });
     } catch (error) {
-      console.error('Erreur lors de l\'appel n8n:', error);
-      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Erreur appel n8n (réseau):`, error?.stack || error);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: error?.message || 'Erreur lors de l\'appel au service d\'analyse',
+        traceId
+      });
     }
 
-    // 7. Lire la réponse brute de n8n
+    if (!n8nResponse.ok) {
+      const errBody = await n8nResponse.text();
+      console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ n8n provider error: status=${n8nResponse.status}, message=${errBody || n8nResponse.statusText}`);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: `Service d'analyse indisponible (${n8nResponse.status})`,
+        traceId
+      });
+    }
+
+    // 8. Lire la réponse brute de n8n
     const rawText = await n8nResponse.text();
-
     if (!rawText || rawText.trim() === "") {
-      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Réponse vide du service d'analyse`);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: 'Réponse vide du service d\'analyse',
+        traceId
+      });
     }
 
-    // 8. Parser la réponse JSON de n8n
+    // 9. Parser la réponse JSON de n8n
     let parsed;
     try {
       parsed = JSON.parse(rawText);
     } catch (e) {
-      console.error('Erreur parsing réponse n8n:', e);
-      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Erreur parsing réponse n8n:`, e?.stack || e);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: 'Réponse invalide du service d\'analyse',
+        traceId
+      });
     }
 
-    // 9. Extraire et parser le champ result (qui contient un JSON stringifié)
     if (!parsed.result) {
-      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.log(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Champ result manquant dans la réponse`);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: 'Champ result manquant dans la réponse',
+        traceId
+      });
     }
 
     let finalObject;
     try {
       finalObject = JSON.parse(parsed.result);
     } catch (e) {
-      console.error('Erreur parsing result:', e);
-      return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+      console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Erreur parsing result:`, e?.stack || e);
+      return res.status(500).json({
+        ok: false,
+        error: 'ANALYZE_ORDONNANCE_FAILED',
+        message: 'Format de résultat invalide',
+        traceId
+      });
     }
 
-    // 10. Vérifier que finalObject est bien un objet
     if (typeof finalObject === 'string') {
       try {
         finalObject = JSON.parse(finalObject);
       } catch (e) {
-        return res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+        console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Erreur parsing result (string):`, e?.stack || e);
+        return res.status(500).json({
+          ok: false,
+          error: 'ANALYZE_ORDONNANCE_FAILED',
+          message: 'Format de résultat invalide',
+          traceId
+        });
       }
     }
 
-    // 11. Transformer la réponse n8n au format Medicalia standard et stocker l'ordonnance
+    // 10. Transformer la réponse n8n au format Medicalia standard et stocker l'ordonnance
     const ordonnanceData = {
       source: 'pdf',
       rawText: extractedText,
@@ -704,12 +794,18 @@ app.post('/analyze-ordonnance', upload.single('file'), async (req, res) => {
     const ordonnance = createOrdonnance(ordonnanceData);
     console.log('[PDF ORD] Ordonnance PDF stockée dans le store principal');
 
-    // 12. Retourner directement l'objet JSON final au client
+    // 11. Retourner directement l'objet JSON final au client
+    console.log(`[ANALYZE_ORDONNANCE][${traceId}] ✅ Analyse terminée avec succès`);
     res.json(finalObject);
 
   } catch (error) {
-    console.error('Erreur générale /analyze-ordonnance:', error);
-    res.status(500).json({ error: 'ANALYZE_ORDONNANCE_FAILED' });
+    console.error(`[ANALYZE_ORDONNANCE][${traceId}] ❌ Erreur générale:`, error?.stack || error);
+    return res.status(500).json({
+      ok: false,
+      error: 'ANALYZE_ORDONNANCE_FAILED',
+      message: error?.message || 'unknown',
+      traceId
+    });
   }
 });
 

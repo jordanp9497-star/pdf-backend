@@ -2,9 +2,9 @@
 
 Ce document décrit les tables Supabase nécessaires pour le système d'invitations.
 
-## Table `profile_invites`
+## Table `profile_invites` (LEGACY)
 
-Table pour stocker les invitations de profils.
+Table pour stocker les invitations de profils (ancienne version - usage unique).
 
 ### Colonnes
 
@@ -26,6 +26,63 @@ CREATE INDEX idx_profile_invites_code ON profile_invites(code) WHERE used_at IS 
 -- Index pour recherche par profil
 CREATE INDEX idx_profile_invites_profile_id ON profile_invites(profile_id);
 ```
+
+## Table `profile_invites_v2` (NOUVELLE - codes hashés + multi-usage)
+
+Table pour stocker les invitations avec codes hashés (plus sécurisé).
+
+**Avantages:**
+- Le code en clair n'est JAMAIS stocké en base (seulement le hash SHA256 + salt)
+- Support multi-usage (max_uses + uses_count)
+- Possibilité de révoquer une invitation
+
+### Colonnes
+
+```sql
+CREATE TABLE profile_invites_v2 (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  profile_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL UNIQUE,  -- SHA256(code + secret), jamais le code en clair
+  expires_at TIMESTAMPTZ NOT NULL,
+  max_uses INTEGER NOT NULL DEFAULT 1,  -- Nombre max d'utilisations
+  uses_count INTEGER NOT NULL DEFAULT 0,  -- Nombre actuel d'utilisations
+  created_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  revoked BOOLEAN NOT NULL DEFAULT FALSE  -- Si true, invitation révoquée
+);
+
+-- Index pour recherche rapide par hash
+CREATE INDEX idx_profile_invites_v2_code_hash ON profile_invites_v2(code_hash);
+
+-- Index pour recherche par profil
+CREATE INDEX idx_profile_invites_v2_profile_id ON profile_invites_v2(profile_id);
+
+-- Index pour invitations actives
+CREATE INDEX idx_profile_invites_v2_active ON profile_invites_v2(code_hash) 
+  WHERE revoked = FALSE AND uses_count < max_uses;
+```
+
+### Variable d'environnement requise
+
+```bash
+# Secret pour le hashing des codes (NE PAS CHANGER après création des premières invitations)
+INVITE_HASH_SECRET=your-secret-key-here
+```
+
+### Fonctionnement
+
+1. **Création (`POST /invites/create`):**
+   - Génère un code de 8 caractères (ex: `ABCD1234`)
+   - Hash le code: `SHA256(code + INVITE_HASH_SECRET)`
+   - Stocke uniquement le hash en base
+   - Retourne le code en clair **UNE SEULE FOIS** au client
+
+2. **Utilisation (`POST /invites/redeem`):**
+   - Reçoit le code en clair du client
+   - Hash le code de la même manière
+   - Recherche l'invitation par hash
+   - Vérifie: non révoqué, non expiré, uses_count < max_uses
+   - Crée l'accès au profil et incrémente uses_count
 
 ### Contraintes
 
