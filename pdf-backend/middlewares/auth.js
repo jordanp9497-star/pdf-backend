@@ -144,6 +144,12 @@ export const authenticateSupabase = async (req, res, next) => {
 };
 
 /**
+ * Alias pour les routes qui exigent un utilisateur authentifié.
+ * Même comportement que authenticateSupabase : Bearer token → req.userId.
+ */
+export const requireUser = authenticateSupabase;
+
+/**
  * Middleware optionnel pour routes publiques (ne fait rien)
  * Utile pour marquer explicitement qu'une route est publique
  */

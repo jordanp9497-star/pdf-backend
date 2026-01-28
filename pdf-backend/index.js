@@ -44,6 +44,7 @@ import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import { randomUUID, createHmac, createHash } from 'crypto';
 import OpenAI from 'openai';
+import PQueue from 'p-queue';
 import { APP_CONFIG } from './src/config/env.js';
 import { supabaseAdmin } from './src/lib/supabaseAdmin.js';
 
@@ -169,6 +170,11 @@ console.log('[DEBUG] routes mounted (GET /debug/env - DEV only)');
 import ordonnancesRouter from './routes/ordonnances.routes.js';
 app.use('/ordonnances', ordonnancesRouter);
 console.log('[ORDONNANCES] routes mounted (POST /ordonnances/:id/recovered)');
+
+// ===== ROUTES PRESCRIPTIONS (import ordonnance PDF) =====
+import prescriptionsRouter from './src/routes/prescriptions.js';
+app.use('/api/prescriptions', prescriptionsRouter);
+console.log('[PRESCRIPTIONS] routes mounted (GET /api/prescriptions, POST /api/prescriptions/import)');
 
 // ===== ROUTES DEVICES =====
 import devicesRouter from './routes/devices.routes.js';
@@ -2301,7 +2307,23 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
         console.log('[OCR_FALLBACK] OCR pré-traité trop court (', textLength1, 'caractères), fallback vers originale');
       }
     } else {
-      console.warn('[OCR_FALLBACK] Erreur OCR pré-traité:', ocrRes1.status);
+      // Si 429, propager l'erreur immédiatement (pas de fallback)
+      if (ocrRes1.status === 429) {
+        const errorText = await ocrRes1.text();
+        const retryAfterHeader = ocrRes1.headers.get('retry-after');
+        const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 30000;
+        
+        console.warn(`[OCR_FALLBACK] ❌ Rate limit Mistral (429), retryAfter: ${retryAfter}ms`);
+        
+        const error = new Error(`OCR Mistral rate limit: ${ocrRes1.status} - ${errorText}`);
+        error.status = 429;
+        error.statusCode = 429;
+        error.retryAfter = retryAfter;
+        error.retryAfterMs = retryAfter;
+        
+        throw error;
+      }
+      console.warn(`[OCR_FALLBACK] Erreur OCR pré-traité: status=${ocrRes1.status}`);
     }
   } catch (error) {
     clearTimeout(timeoutId1);
@@ -2359,7 +2381,46 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
     
     if (!ocrRes2.ok) {
       const errorText = await ocrRes2.text();
-      throw new Error(`OCR Mistral failed: ${ocrRes2.status} - ${errorText}`);
+      let providerStatus = ocrRes2.status;
+      let isRateLimit = providerStatus === 429;
+      let providerCode = null;
+
+      try {
+        const errBody = JSON.parse(errorText);
+        providerCode = errBody?.code ?? errBody?.error?.code ?? null;
+        if (providerCode === 1300 || (errBody?.message && String(errBody.message).includes('Rate limit exceeded'))) {
+          isRateLimit = true;
+          providerStatus = 429;
+        }
+      } catch (_) {
+        if (errorText.includes('Rate limit exceeded')) {
+          isRateLimit = true;
+          providerStatus = 429;
+        }
+      }
+
+      const retryAfterHeader = ocrRes2.headers.get('retry-after');
+      const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : (isRateLimit ? 30000 : null);
+
+      if (isRateLimit) {
+        console.warn(`[OCR_FALLBACK] ❌ Rate limit Mistral (429 / code ${providerCode ?? 'n/a'}), retryAfter: ${retryAfter}ms`);
+      } else {
+        console.warn(`[OCR_FALLBACK] ❌ Erreur Mistral: status=${ocrRes2.status}`);
+      }
+
+      const error = new Error(`OCR Mistral failed: ${providerStatus} - ${errorText}`);
+      error.status = providerStatus;
+      error.statusCode = providerStatus;
+      if (providerCode != null) {
+        error.code = providerCode;
+        error.errorCode = providerCode;
+      }
+      if (retryAfter) {
+        error.retryAfter = retryAfter;
+        error.retryAfterMs = retryAfter;
+      }
+
+      throw error;
     }
     
     const ocrData2 = await ocrRes2.json();
@@ -3365,6 +3426,10 @@ app.post('/api/ordonnance/extract-text',
   }
 );
 
+// File d'attente OCR avec concurrence = 1 (throttling)
+const ocrQueue = new PQueue({ concurrency: 1 });
+const OCR_QUEUE_MAX_SIZE = 2; // Si la queue dépasse 2 jobs, renvoyer 429 OCR_BUSY
+
 /**
  * Route POST /api/ordonnance/ocr-base64
  * 
@@ -3372,6 +3437,7 @@ app.post('/api/ordonnance/extract-text',
  * - Auth Bearer obligatoire
  * - Attend JSON: { imageBase64: string, profile_id?: string, device_id?: string }
  * - Décode base64 en Buffer et passe dans le pipeline OCR existant
+ * - Throttling: file d'attente avec concurrence = 1
  * - Retourne: { ok: true, rawText }
  */
 app.post('/api/ordonnance/ocr-base64',
@@ -3441,12 +3507,48 @@ app.post('/api/ordonnance/ocr-base64',
         });
       }
 
-      // 4. Utiliser le pipeline OCR existant (ocrWithFallback)
+      // 4. Vérifier la taille de la file d'attente (throttling)
+      const queueSize = ocrQueue.size;
+      const pendingCount = ocrQueue.pending;
+      console.log(`[OCR_BASE64][${traceId}] File OCR: size=${queueSize}, pending=${pendingCount}`);
+
+      if (queueSize > OCR_QUEUE_MAX_SIZE) {
+        console.log(`[OCR_BASE64][${traceId}] ❌ Queue OCR saturée (size=${queueSize} > ${OCR_QUEUE_MAX_SIZE})`);
+        return res.status(429).json({
+          ok: false,
+          error: 'OCR_BUSY',
+          message: 'OCR occupé, réessayez dans quelques instants',
+          retryAfterMs: 30000,
+          traceId
+        });
+      }
+
+      // 5. Utiliser le pipeline OCR existant via la file d'attente (ocrWithFallback)
       let ocrResult;
       try {
-        ocrResult = await ocrWithFallback(imageBase64, mimeType, mistralApiKey);
+        ocrResult = await ocrQueue.add(async () => {
+          console.log(`[OCR_BASE64][${traceId}] Début OCR (provider=Mistral, queue size=${ocrQueue.size}, pending=${ocrQueue.pending})`);
+          return await ocrWithFallback(imageBase64, mimeType, mistralApiKey);
+        });
       } catch (error) {
+        // Gérer les erreurs rate limit (HTTP 429 / "Rate limit exceeded" / code 1300) => ne pas renvoyer 500
+        const isRateLimit = error.status === 429 || error.statusCode === 429 ||
+          (error.message && String(error.message).includes('Rate limit exceeded')) ||
+          error.code === 1300 || error.errorCode === 1300;
+        if (isRateLimit) {
+          const retryAfter = error.retryAfter ?? error.retryAfterMs ?? 30000;
+          console.error(`[OCR_BASE64][${traceId}] ❌ OCR_RATE_LIMIT provider status=${error.status ?? error.statusCode ?? 'unknown'}, retryAfterMs=${retryAfter}, queue size=${ocrQueue.size}`);
+          return res.status(429).json({
+            ok: false,
+            error: 'OCR_RATE_LIMIT',
+            message: 'OCR saturé, réessayez dans quelques instants',
+            retryAfterMs: retryAfter,
+            traceId
+          });
+        }
+
         console.error(`[OCR_BASE64][${traceId}] ❌ Erreur OCR:`, error?.stack || error);
+        console.error(`[OCR_BASE64][${traceId}] provider status: ${error.status ?? error.statusCode ?? 'unknown'}, queue size: ${ocrQueue.size}`);
         return res.status(500).json({
           ok: false,
           error: 'OCR_FAILED',
@@ -3457,7 +3559,10 @@ app.post('/api/ordonnance/ocr-base64',
 
       const { text: rawText, meta } = ocrResult;
 
-      // 5. Validation: texte OCR non vide
+      // Logs: traceId + statut provider + queue size
+      console.log(`[OCR_BASE64][${traceId}] ✅ OCR terminé (provider status=ok, queue size=${ocrQueue.size}) ${rawText.length} caractères`);
+
+      // 6. Validation: texte OCR non vide
       if (!rawText || rawText.trim().length === 0) {
         console.log(`[OCR_BASE64][${traceId}] ❌ Texte OCR vide`);
         return res.status(400).json({
@@ -3468,10 +3573,7 @@ app.post('/api/ordonnance/ocr-base64',
         });
       }
 
-      // Logs serveur
-      console.log(`[OCR_BASE64][${traceId}] ✅ OCR terminé: ${rawText.length} caractères extraits`);
-
-      // 6. Retourner le texte brut
+      // 7. Retourner le texte brut
       return res.status(200).json({
         ok: true,
         rawText
