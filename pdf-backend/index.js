@@ -3190,41 +3190,74 @@ app.post('/api/ordonnance/finalize', (req, res) => {
   }
 });
 
+/**
+ * Routes pour l'analyse d'ordonnances:
+ * 
+ * POST /api/ordonnance/analyze
+ *   - Attend JSON: { rawText: string }
+ *   - Analyse un texte brut d'ordonnance déjà extrait
+ *   - Retourne: { output: analyzedData }
+ * 
+ * POST /api/ordonnance/ocr
+ *   - Attend JSON: { source, rawText, createdAt? }
+ *   - Crée une ordonnance issue de l'OCR manuscrit
+ * 
+ * POST /analyze-ordonnance
+ *   - Attend multipart/form-data avec champ "file" (PDF)
+ *   - Extrait le texte du PDF et l'analyse
+ *   - Retourne l'objet JSON structuré
+ */
 // Route POST /api/ordonnance/analyze - Analyser un texte brut d'ordonnance
 app.post('/api/ordonnance/analyze', (req, res) => {
-  console.log('[ANALYZE] POST /api/ordonnance/analyze appelée');
+  const traceId = randomUUID();
+  console.log(`[ANALYZE][${traceId}] POST /api/ordonnance/analyze appelée`);
 
   try {
+    // Vérifier que le Content-Type n'est pas multipart/form-data
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('multipart/form-data')) {
+      console.log(`[ANALYZE][${traceId}] ❌ Content-Type multipart/form-data reçu (attendu: application/json)`);
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_CONTENT_TYPE',
+        message: 'Ce endpoint attend JSON { rawText }. Utilisez /api/ordonnance/ocr (ou endpoint upload PDF) pour envoyer un PDF.',
+        traceId
+      });
+    }
+
     const { rawText } = req.body;
 
     // Validation
     if (!rawText || typeof rawText !== 'string' || rawText.trim().length === 0) {
+      console.log(`[ANALYZE][${traceId}] ❌ rawText invalide ou manquant`);
       return res.status(400).json({
         success: false,
         error: 'INVALID_RAWTEXT',
-        message: 'Le champ rawText est requis et ne peut pas être vide'
+        message: 'Le champ rawText est requis et ne peut pas être vide',
+        traceId
       });
     }
 
     // Analyser le texte brut
     const analyzedData = analyzeOrdonnanceText(rawText);
 
-    console.log('[ANALYZE] Analyse terminée');
-    console.log('[ANALYZE] Score de confiance:', analyzedData.confidenceScore);
-    console.log('[ANALYZE] Médecin:', analyzedData.doctor.name);
-    console.log('[ANALYZE] Patient:', analyzedData.patient.name);
-    console.log('[ANALYZE] Prescriptions:', analyzedData.prescription.length);
+    console.log(`[ANALYZE][${traceId}] ✅ Analyse terminée`);
+    console.log(`[ANALYZE][${traceId}] Score de confiance:`, analyzedData.confidenceScore);
+    console.log(`[ANALYZE][${traceId}] Médecin:`, analyzedData.doctor.name);
+    console.log(`[ANALYZE][${traceId}] Patient:`, analyzedData.patient.name);
+    console.log(`[ANALYZE][${traceId}] Prescriptions:`, analyzedData.prescription.length);
 
     // Retourner le JSON strict enveloppé dans { output: ... }
     return res.json({ output: analyzedData });
 
   } catch (error) {
-    console.error('[ANALYZE] ❌ Erreur lors de l\'analyse:', error.message);
+    console.error(`[ANALYZE][${traceId}] ❌ Erreur lors de l'analyse:`, error?.stack || error);
     res.status(500).json({
       success: false,
       error: 'ANALYSIS_ERROR',
       message: 'Erreur lors de l\'analyse de l\'ordonnance',
-      details: error.message
+      details: error.message,
+      traceId
     });
   }
 });
