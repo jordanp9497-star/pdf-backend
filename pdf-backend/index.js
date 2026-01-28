@@ -3193,6 +3193,12 @@ app.post('/api/ordonnance/finalize', (req, res) => {
 /**
  * Routes pour l'analyse d'ordonnances:
  * 
+ * POST /api/ordonnance/extract-text
+ *   - Auth Bearer obligatoire
+ *   - Attend multipart/form-data avec champ "file" (PDF)
+ *   - Extrait le texte brut du PDF
+ *   - Retourne: { ok: true, rawText, meta: { pages?, length } }
+ * 
  * POST /api/ordonnance/analyze
  *   - Attend JSON: { rawText: string }
  *   - Analyse un texte brut d'ordonnance déjà extrait
@@ -3261,6 +3267,227 @@ app.post('/api/ordonnance/analyze', (req, res) => {
     });
   }
 });
+
+/**
+ * Route POST /api/ordonnance/extract-text
+ * 
+ * Extrait le texte brut d'un PDF
+ * - Auth Bearer obligatoire (même logique que /api/ordonnance/analyze)
+ * - Attend multipart/form-data avec champ "file" (PDF)
+ * - Limite: 10MB
+ * - Retourne: { ok: true, rawText, meta: { length } }
+ */
+app.post('/api/ordonnance/extract-text', 
+  authenticateSupabase,
+  upload.single('file'),
+  async (req, res) => {
+    const traceId = randomUUID();
+    console.log(`[EXTRACT_TEXT][${traceId}] POST /api/ordonnance/extract-text appelée`);
+
+    try {
+      // 1. Validation: fichier requis
+      if (!req.file) {
+        console.log(`[EXTRACT_TEXT][${traceId}] ❌ Fichier manquant`);
+        return res.status(400).json({
+          ok: false,
+          error: 'MISSING_FILE',
+          traceId
+        });
+      }
+
+      // 2. Validation: fichier non vide
+      if (req.file.size === 0) {
+        console.log(`[EXTRACT_TEXT][${traceId}] ❌ Fichier vide (size=0)`);
+        return res.status(400).json({
+          ok: false,
+          error: 'EMPTY_FILE',
+          traceId
+        });
+      }
+
+      // Logs serveur
+      console.log(`[EXTRACT_TEXT][${traceId}] mimetype: ${req.file.mimetype}, size: ${req.file.size} bytes`);
+
+      // 3. Extraire le texte du PDF avec pdf-parse
+      let pdfData;
+      try {
+        pdfData = await pdfParse(req.file.buffer);
+      } catch (error) {
+        console.error(`[EXTRACT_TEXT][${traceId}] ❌ Erreur extraction PDF:`, error?.stack || error);
+        return res.status(500).json({
+          ok: false,
+          error: 'EXTRACT_TEXT_FAILED',
+          message: error?.message || 'Erreur lors de l\'extraction du texte du PDF',
+          traceId
+        });
+      }
+
+      // 4. Extraire le texte brut
+      const rawText = pdfData.text?.trim() || '';
+      const rawTextLength = rawText.length;
+
+      // Logs serveur
+      console.log(`[EXTRACT_TEXT][${traceId}] rawTextLength: ${rawTextLength} caractères`);
+
+      // 5. Validation: texte extrait non vide
+      if (!rawText || rawTextLength === 0) {
+        console.log(`[EXTRACT_TEXT][${traceId}] ❌ Aucun texte extrait du PDF (PDF scanné probablement)`);
+        return res.status(422).json({
+          ok: false,
+          error: 'NO_TEXT_IN_PDF',
+          traceId
+        });
+      }
+
+      // 6. Préparer les métadonnées
+      const meta = {
+        length: rawTextLength
+      };
+
+      console.log(`[EXTRACT_TEXT][${traceId}] ✅ Texte extrait avec succès: ${rawTextLength} caractères`);
+
+      // 7. Retourner le texte brut
+      return res.status(200).json({
+        ok: true,
+        rawText,
+        meta
+      });
+
+    } catch (error) {
+      console.error(`[EXTRACT_TEXT][${traceId}] ❌ Erreur générale:`, error?.stack || error);
+      return res.status(500).json({
+        ok: false,
+        error: 'EXTRACT_TEXT_FAILED',
+        message: error?.message || 'Erreur lors de l\'extraction du texte',
+        traceId
+      });
+    }
+  }
+);
+
+/**
+ * Route POST /api/ordonnance/ocr-base64
+ * 
+ * OCR d'une image base64 (même pipeline que la caméra)
+ * - Auth Bearer obligatoire
+ * - Attend JSON: { imageBase64: string, profile_id?: string, device_id?: string }
+ * - Décode base64 en Buffer et passe dans le pipeline OCR existant
+ * - Retourne: { ok: true, rawText }
+ */
+app.post('/api/ordonnance/ocr-base64',
+  authenticateSupabase,
+  async (req, res) => {
+    const traceId = randomUUID();
+    console.log(`[OCR_BASE64][${traceId}] POST /api/ordonnance/ocr-base64 appelée`);
+
+    try {
+      // 1. Validation: imageBase64 requis
+      const { imageBase64, profile_id, device_id } = req.body;
+
+      if (!imageBase64 || typeof imageBase64 !== 'string' || imageBase64.trim().length === 0) {
+        console.log(`[OCR_BASE64][${traceId}] ❌ imageBase64 manquant ou invalide`);
+        return res.status(400).json({
+          ok: false,
+          error: 'INVALID_IMAGE',
+          message: 'Le champ imageBase64 (string) est requis',
+          traceId
+        });
+      }
+
+      // Logs serveur
+      console.log(`[OCR_BASE64][${traceId}] imageBase64 length: ${imageBase64.length} caractères`);
+      if (profile_id) console.log(`[OCR_BASE64][${traceId}] profile_id: ${profile_id}`);
+      if (device_id) console.log(`[OCR_BASE64][${traceId}] device_id: ${device_id}`);
+
+      // 2. Décoder le base64 en Buffer
+      let base64Data = imageBase64;
+      let mimeType = 'image/jpeg';
+
+      // Supporter data URI: "data:image/jpeg;base64,...." -> strip le préfixe si présent
+      if (base64Data.includes(',')) {
+        const parts = base64Data.split(',');
+        base64Data = parts[1];
+        if (parts[0].startsWith('data:')) {
+          const mimeMatch = parts[0].match(/data:([^;]+)/);
+          if (mimeMatch) {
+            mimeType = mimeMatch[1];
+          }
+        }
+      }
+
+      let imageBuffer;
+      try {
+        imageBuffer = Buffer.from(base64Data, 'base64');
+        console.log(`[OCR_BASE64][${traceId}] Buffer créé: ${imageBuffer.length} bytes, mimeType: ${mimeType}`);
+      } catch (error) {
+        console.error(`[OCR_BASE64][${traceId}] ❌ Erreur décodage base64:`, error?.stack || error);
+        return res.status(400).json({
+          ok: false,
+          error: 'INVALID_IMAGE',
+          message: 'Erreur lors du décodage de l\'image base64',
+          traceId
+        });
+      }
+
+      // 3. Vérifier que MISTRAL_API_KEY est présente
+      const mistralApiKey = process.env.MISTRAL_API_KEY;
+      if (!mistralApiKey) {
+        console.error(`[OCR_BASE64][${traceId}] ❌ MISTRAL_API_KEY non définie`);
+        return res.status(500).json({
+          ok: false,
+          error: 'OCR_FAILED',
+          message: 'MISTRAL_API_KEY non configurée',
+          traceId
+        });
+      }
+
+      // 4. Utiliser le pipeline OCR existant (ocrWithFallback)
+      let ocrResult;
+      try {
+        ocrResult = await ocrWithFallback(imageBase64, mimeType, mistralApiKey);
+      } catch (error) {
+        console.error(`[OCR_BASE64][${traceId}] ❌ Erreur OCR:`, error?.stack || error);
+        return res.status(500).json({
+          ok: false,
+          error: 'OCR_FAILED',
+          message: error?.message || 'Erreur lors du traitement OCR',
+          traceId
+        });
+      }
+
+      const { text: rawText, meta } = ocrResult;
+
+      // 5. Validation: texte OCR non vide
+      if (!rawText || rawText.trim().length === 0) {
+        console.log(`[OCR_BASE64][${traceId}] ❌ Texte OCR vide`);
+        return res.status(400).json({
+          ok: false,
+          error: 'EMPTY_OCR_TEXT',
+          message: 'Aucun texte extrait de l\'image',
+          traceId
+        });
+      }
+
+      // Logs serveur
+      console.log(`[OCR_BASE64][${traceId}] ✅ OCR terminé: ${rawText.length} caractères extraits`);
+
+      // 6. Retourner le texte brut
+      return res.status(200).json({
+        ok: true,
+        rawText
+      });
+
+    } catch (error) {
+      console.error(`[OCR_BASE64][${traceId}] ❌ Erreur générale:`, error?.stack || error);
+      return res.status(500).json({
+        ok: false,
+        error: 'OCR_FAILED',
+        message: error?.message || 'Erreur lors du traitement OCR',
+        traceId
+      });
+    }
+  }
+);
 
 app.get('/api/ordonnances', (req, res) => {
   console.log('[ORD LIST] GET /api/ordonnances - Récupération de toutes les ordonnances');
@@ -5537,6 +5764,8 @@ app.use((req, res) => {
       'GET /test-n8n',
       'POST /api/ocr/handwritten',
       'POST /api/ordonnances/create',
+      'POST /api/ordonnance/extract-text',
+      'POST /api/ordonnance/ocr-base64',
       'POST /api/ordonnance/ocr',
       'POST /api/ordonnance/analyze',
       'POST /api/ordonnance/photo',
