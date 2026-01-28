@@ -178,7 +178,7 @@ router.post(
 /**
  * POST /api/prescriptions/import-pdf
  *
- * Entrée: multipart/form-data — file (obligatoire), profile_id (obligatoire).
+ * Entrée: multipart/form-data — file (obligatoire), profile_id ou profileId (body/query, obligatoire).
  * 1) Auth requireUser (req.userId)
  * 2) Upload fichier brut Supabase Storage (bucket prescriptions) via storageService
  * 3) Extraction texte : PDF => pdf-parse ; rawText nettoyé ; si vide ou < 30 chars => status needs_manual, raw_text null ; sinon draft + raw_text
@@ -203,7 +203,11 @@ router.post(
       });
     }
 
-    const profileId = typeof req.body?.profile_id === 'string' ? req.body.profile_id.trim() : '';
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[PRESCRIPTIONS] import-pdf body keys', Object.keys(req.body || {}));
+    }
+    const rawProfileId = req.body?.profile_id ?? req.body?.profileId ?? req.query?.profile_id;
+    const profileId = typeof rawProfileId === 'string' ? rawProfileId.trim() : '';
     if (!profileId) {
       return res.status(400).json({
         ok: false,
