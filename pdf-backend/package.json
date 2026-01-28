@@ -28,7 +28,8 @@
     "openai": "^6.16.0",
     "p-queue": "^9.1.0",
     "pdf-parse": "^1.1.4",
-    "stripe": "^14.21.0"
+    "stripe": "^14.21.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "tsx": "^4.7.0",

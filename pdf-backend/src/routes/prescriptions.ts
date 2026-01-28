@@ -2,9 +2,9 @@
  * Routes prescriptions – import ordonnance PDF
  *
  * Tables Supabase:
- * - prescriptions (header, raw_text, statut)
- * - prescription_files (bucket, path, mime, size)
- * - prescription_items (médicaments structurés)
+ * - prescriptions (owner_user_id, profile_id, status, raw_text, date_ordonnance, medecin_*, patient_*)
+ * - prescription_files (prescription_id, bucket, path, mime_type, size, original_name)
+ * - prescription_items (prescription_id + nom, dosage, forme, …)
  *
  * Monté sur /api/prescriptions
  */
@@ -15,16 +15,32 @@ import pdfParse from 'pdf-parse';
 import { randomUUID } from 'crypto';
 import { requireUser } from '../../middlewares/auth.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import {
+  uploadBufferToStorage,
+  buildPrescriptionStoragePath,
+  createSignedUrl,
+} from '../services/storageService.js';
+import { structurizePrescriptionText } from '../services/prescriptionStructService.js';
+import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
 
 const router = express.Router();
 
+const BUCKET = 'prescriptions';
+const UPLOAD_LIMIT = 10 * 1024 * 1024; // 10MB
+
 const uploadPdf = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: UPLOAD_LIMIT },
   fileFilter: (_req, file, cb) => {
     const ok = file.mimetype === 'application/pdf';
     cb(null, ok);
   },
+});
+
+/** Multer pour import-pdf : champ "file", 10MB (PDF ou autre pour extension future) */
+const uploadImportPdf = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: UPLOAD_LIMIT },
 });
 
 /**
@@ -160,6 +176,194 @@ router.post(
 );
 
 /**
+ * POST /api/prescriptions/import-pdf
+ *
+ * Entrée: multipart/form-data — file (obligatoire), profile_id (obligatoire).
+ * 1) Auth requireUser (req.userId)
+ * 2) Upload fichier brut Supabase Storage (bucket prescriptions) via storageService
+ * 3) Extraction texte : PDF => pdf-parse ; rawText nettoyé ; si vide ou < 30 chars => status needs_manual, raw_text null ; sinon draft + raw_text
+ * 4) Si rawText : OpenAI structuration → JSON validé zod ; fallback header null + items []
+ * 5) Insert prescriptions, prescription_files, prescription_items
+ * Réponse: 200 { ok, prescriptionId, status, extracted, itemsCount } | 422 NO_TEXT_IN_PDF | 400 MISSING_FILE / MISSING_PROFILE_ID
+ */
+router.post(
+  '/import-pdf',
+  requireUser,
+  uploadImportPdf.single('file'),
+  async (req: Request, res: Response) => {
+    type ReqWithUser = Request & { userId?: string };
+    const reqUser = req as ReqWithUser;
+    const userId = reqUser.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise',
+      });
+    }
+
+    const profileId = typeof req.body?.profile_id === 'string' ? req.body.profile_id.trim() : '';
+    if (!profileId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'MISSING_PROFILE_ID',
+        message: 'Le champ profile_id est obligatoire',
+      });
+    }
+
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({
+        ok: false,
+        error: 'MISSING_FILE',
+        message: 'Le champ fichier "file" est obligatoire',
+      });
+    }
+
+    const buffer = req.file.buffer as Buffer;
+    const contentType = req.file.mimetype || 'application/octet-stream';
+    const size = buffer.length;
+    const originalName = req.file.originalname || 'document.pdf';
+    const prescriptionId = randomUUID();
+
+    try {
+      const storagePath = buildPrescriptionStoragePath(
+        userId,
+        profileId,
+        prescriptionId,
+        originalName
+      );
+      await uploadBufferToStorage({
+        bucket: BUCKET,
+        path: storagePath,
+        buffer,
+        contentType,
+      });
+    } catch (storageErr) {
+      console.error('[PRESCRIPTIONS] import-pdf storage upload:', storageErr);
+      return res.status(500).json({
+        ok: false,
+        error: 'STORAGE_ERROR',
+        message: 'Erreur lors de l\'upload du fichier',
+      });
+    }
+
+    let rawText = '';
+    if (contentType === 'application/pdf') {
+      try {
+        const parsed = await pdfParse(buffer);
+        rawText = (parsed.text || '').replace(/\s+/g, ' ').trim();
+      } catch {
+        rawText = '';
+      }
+    }
+
+    const prescriptionStatus = !rawText || rawText.length < 30 ? 'needs_manual' : 'draft';
+    const rawTextForDb = prescriptionStatus === 'draft' ? rawText : null;
+
+    let extracted: PrescriptionStruct = {
+      date_ordonnance: null,
+      medecin: null,
+      patient: null,
+      items: [],
+    };
+
+    if (rawText && rawText.length >= 30) {
+      const openaiKey =
+        process.env.OPENAI_API_KEY || (req.app?.locals && (req.app.locals as { OPENAI_API_KEY?: string }).OPENAI_API_KEY);
+      if (openaiKey) {
+        try {
+          extracted = await structurizePrescriptionText({ openaiApiKey: openaiKey, rawText });
+        } catch (err) {
+          console.error('[PRESCRIPTIONS] import-pdf OpenAI struct:', err);
+        }
+      }
+    }
+
+    const medecin = extracted.medecin;
+    const patient = extracted.patient;
+
+    const { error: prescError } = await supabaseAdmin.from('prescriptions').insert({
+      id: prescriptionId,
+      owner_user_id: userId,
+      profile_id: profileId,
+      status: prescriptionStatus,
+      raw_text: rawTextForDb,
+      date_ordonnance: extracted.date_ordonnance ?? null,
+      medecin_nom: medecin?.nom ?? null,
+      medecin_prenom: medecin?.prenom ?? null,
+      medecin_rpps: medecin?.rpps ?? null,
+      patient_nom: patient?.nom ?? null,
+      patient_prenom: patient?.prenom ?? null,
+      patient_date_naissance: patient?.date_naissance ?? null,
+    });
+
+    if (prescError) {
+      console.error('[PRESCRIPTIONS] import-pdf insert prescription:', prescError);
+      return res.status(500).json({
+        ok: false,
+        error: 'DATABASE_ERROR',
+        message: 'Erreur lors de la création de la prescription',
+      });
+    }
+
+    const { error: fileError } = await supabaseAdmin.from('prescription_files').insert({
+      prescription_id: prescriptionId,
+      bucket: BUCKET,
+      path: buildPrescriptionStoragePath(userId, profileId, prescriptionId, originalName),
+      mime_type: contentType,
+      size,
+      original_name: originalName,
+    });
+
+    if (fileError) {
+      console.error('[PRESCRIPTIONS] import-pdf insert prescription_files:', fileError);
+    }
+
+    const items = Array.isArray(extracted.items) ? extracted.items : [];
+    let itemsCount = 0;
+    if (items.length > 0) {
+      const rows = items.slice(0, 500).map((item) => ({
+        prescription_id: prescriptionId,
+        nom: item.nom ?? null,
+        dosage: item.dosage ?? null,
+        forme: item.forme ?? null,
+        frequence_par_jour: item.frequence_par_jour ?? null,
+        moment: item.moment ?? null,
+        duree: item.duree ?? null,
+        instructions: item.instructions ?? null,
+      }));
+      const { error: itemsError } = await supabaseAdmin.from('prescription_items').insert(rows);
+      if (!itemsError) itemsCount = rows.length;
+      else console.error('[PRESCRIPTIONS] import-pdf insert prescription_items:', itemsError);
+    }
+
+    if (prescriptionStatus === 'needs_manual') {
+      return res.status(422).json({
+        ok: false,
+        error: 'NO_TEXT_IN_PDF',
+        message: 'PDF scanné ou texte insuffisant ; saisie manuelle requise',
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      prescriptionId,
+      status: prescriptionStatus,
+      extracted: {
+        date_ordonnance: extracted.date_ordonnance,
+        medecin: extracted.medecin,
+        patient: extracted.patient,
+        itemsCount,
+      },
+      itemsCount,
+    });
+  }
+);
+
+const SIGNED_URL_EXPIRES_IN = 3600; // 1h
+
+/**
  * GET /api/prescriptions
  *
  * Liste les prescriptions de l'utilisateur (requireUser).
@@ -177,8 +381,8 @@ router.get('/', requireUser, async (req: Request, res: Response) => {
 
     const { data, error } = await supabaseAdmin
       .from('prescriptions')
-      .select('id, header, raw_text, statut, created_at')
-      .eq('user_id', userId)
+      .select('id, profile_id, raw_text, statut, status, created_at')
+      .or(`owner_user_id.eq.${userId},user_id.eq.${userId}`)
       .order('created_at', { ascending: false })
       .limit(100);
 
@@ -194,6 +398,278 @@ router.get('/', requireUser, async (req: Request, res: Response) => {
     return res.status(200).json({ ok: true, prescriptions: data ?? [] });
   } catch (err) {
     console.error('[PRESCRIPTIONS] list error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'INTERNAL_ERROR',
+      message: 'Erreur serveur',
+    });
+  }
+});
+
+/**
+ * GET /api/prescriptions/:id
+ *
+ * Auth requireUser. Charge prescription (doit appartenir à req.userId),
+ * 1er prescription_files, prescription_items. Génère signedUrl (3600s).
+ * Réponse: { ok: true, prescription: {...}, file: {...signedUrl}, items: [...] }
+ */
+router.get('/:id', requireUser, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as Request & { userId?: string }).userId;
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise',
+      });
+    }
+
+    const id = req.params.id?.trim();
+    if (!id) {
+      return res.status(400).json({
+        ok: false,
+        error: 'BAD_REQUEST',
+        message: 'ID de prescription requis',
+      });
+    }
+
+    const { data: prescription, error: prescError } = await supabaseAdmin
+      .from('prescriptions')
+      .select('*')
+      .eq('id', id)
+      .or(`owner_user_id.eq.${userId},user_id.eq.${userId}`)
+      .maybeSingle();
+
+    if (prescError) {
+      console.error('[PRESCRIPTIONS] get by id:', prescError);
+      return res.status(500).json({
+        ok: false,
+        error: 'DATABASE_ERROR',
+        message: 'Erreur lors de la récupération de la prescription',
+      });
+    }
+
+    if (!prescription) {
+      return res.status(404).json({
+        ok: false,
+        error: 'NOT_FOUND',
+        message: 'Prescription introuvable',
+      });
+    }
+
+    const { data: files } = await supabaseAdmin
+      .from('prescription_files')
+      .select('bucket, path, mime_type, size, original_name')
+      .eq('prescription_id', id)
+      .limit(1);
+
+    const firstFile = Array.isArray(files) && files.length > 0 ? files[0] : null;
+    let filePayload: { signedUrl: string; bucket: string; path: string; mime_type: string | null; size: number | null; original_name: string | null } | null = null;
+
+    if (firstFile && firstFile.bucket && firstFile.path) {
+      try {
+        const signedUrl = await createSignedUrl({
+          bucket: firstFile.bucket,
+          path: firstFile.path,
+          expiresIn: SIGNED_URL_EXPIRES_IN,
+        });
+        filePayload = {
+          signedUrl,
+          bucket: firstFile.bucket,
+          path: firstFile.path,
+          mime_type: firstFile.mime_type ?? null,
+          size: firstFile.size ?? null,
+          original_name: firstFile.original_name ?? null,
+        };
+      } catch (urlErr) {
+        console.error('[PRESCRIPTIONS] signed url:', urlErr);
+      }
+    }
+
+    const { data: items } = await supabaseAdmin
+      .from('prescription_items')
+      .select('*')
+      .eq('prescription_id', id)
+      .order('created_at', { ascending: true });
+
+    return res.status(200).json({
+      ok: true,
+      prescription,
+      file: filePayload,
+      items: items ?? [],
+    });
+  } catch (err) {
+    console.error('[PRESCRIPTIONS] get by id error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'INTERNAL_ERROR',
+      message: 'Erreur serveur',
+    });
+  }
+});
+
+/**
+ * Body JSON pour PATCH /api/prescriptions/:id (écran de vérification)
+ */
+type PatchPrescriptionBody = {
+  status?: 'verified' | 'draft' | 'needs_manual';
+  date_ordonnance?: string | null;
+  medecin?: { nom?: string | null; prenom?: string | null; rpps?: string | null };
+  patient?: { nom?: string | null; prenom?: string | null; date_naissance?: string | null };
+  items?: Array<{
+    id?: string;
+    nom: string;
+    dosage?: string | null;
+    forme?: string | null;
+    frequence_par_jour?: number | null;
+    moment?: string | null;
+    duree?: string | null;
+    instructions?: string | null;
+  }>;
+};
+
+/**
+ * PATCH /api/prescriptions/:id
+ *
+ * Sauvegarde écran de vérification. Auth requireUser.
+ * Update prescriptions (status, date_ordonnance, medecin_*, patient_*).
+ * Upsert items : item.id présent => update, sinon insert ; supprimer les items absents de la liste si items fourni.
+ * Retour: { ok: true }
+ */
+router.patch('/:id', requireUser, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as Request & { userId?: string }).userId;
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise',
+      });
+    }
+
+    const id = req.params.id?.trim();
+    if (!id) {
+      return res.status(400).json({
+        ok: false,
+        error: 'BAD_REQUEST',
+        message: 'ID de prescription requis',
+      });
+    }
+
+    const { data: prescription, error: prescError } = await supabaseAdmin
+      .from('prescriptions')
+      .select('id')
+      .eq('id', id)
+      .or(`owner_user_id.eq.${userId},user_id.eq.${userId}`)
+      .maybeSingle();
+
+    if (prescError) {
+      console.error('[PRESCRIPTIONS] patch load:', prescError);
+      return res.status(500).json({
+        ok: false,
+        error: 'DATABASE_ERROR',
+        message: 'Erreur lors de la récupération de la prescription',
+      });
+    }
+
+    if (!prescription) {
+      return res.status(404).json({
+        ok: false,
+        error: 'NOT_FOUND',
+        message: 'Prescription introuvable',
+      });
+    }
+
+    const body = (req.body || {}) as PatchPrescriptionBody;
+
+    const updatePresc: Record<string, unknown> = {};
+    if (body.status !== undefined) updatePresc.status = body.status;
+    if (body.date_ordonnance !== undefined) updatePresc.date_ordonnance = body.date_ordonnance ?? null;
+    if (body.medecin !== undefined) {
+      updatePresc.medecin_nom = body.medecin.nom ?? null;
+      updatePresc.medecin_prenom = body.medecin.prenom ?? null;
+      updatePresc.medecin_rpps = body.medecin.rpps ?? null;
+    }
+    if (body.patient !== undefined) {
+      updatePresc.patient_nom = body.patient.nom ?? null;
+      updatePresc.patient_prenom = body.patient.prenom ?? null;
+      updatePresc.patient_date_naissance = body.patient.date_naissance ?? null;
+    }
+
+    if (Object.keys(updatePresc).length > 0) {
+      const { error: updateError } = await supabaseAdmin
+        .from('prescriptions')
+        .update(updatePresc)
+        .eq('id', id);
+
+      if (updateError) {
+        console.error('[PRESCRIPTIONS] patch update prescription:', updateError);
+        return res.status(500).json({
+          ok: false,
+          error: 'DATABASE_ERROR',
+          message: 'Erreur lors de la mise à jour de la prescription',
+        });
+      }
+    }
+
+    if (body.items !== undefined) {
+      const items = Array.isArray(body.items) ? body.items : [];
+      const keptIds: string[] = [];
+
+      for (const item of items) {
+        const nom = typeof item.nom === 'string' ? item.nom.trim() : '';
+        const row = {
+          prescription_id: id,
+          nom: nom || null,
+          dosage: item.dosage ?? null,
+          forme: item.forme ?? null,
+          frequence_par_jour: item.frequence_par_jour ?? null,
+          moment: item.moment ?? null,
+          duree: item.duree ?? null,
+          instructions: item.instructions ?? null,
+        };
+
+        if (item.id && item.id.trim()) {
+          const { error: upErr } = await supabaseAdmin
+            .from('prescription_items')
+            .update(row)
+            .eq('id', item.id.trim())
+            .eq('prescription_id', id);
+
+          if (!upErr) keptIds.push(item.id.trim());
+          else console.error('[PRESCRIPTIONS] patch update item:', upErr);
+        } else {
+          const { data: inserted } = await supabaseAdmin
+            .from('prescription_items')
+            .insert(row)
+            .select('id')
+            .single();
+
+          if (inserted?.id) keptIds.push(inserted.id);
+        }
+      }
+
+      const { data: existingItems } = await supabaseAdmin
+        .from('prescription_items')
+        .select('id')
+        .eq('prescription_id', id);
+
+      const toDelete = (existingItems ?? [])
+        .map((r) => r.id)
+        .filter((itemId) => itemId && !keptIds.includes(itemId));
+
+      if (toDelete.length > 0) {
+        await supabaseAdmin
+          .from('prescription_items')
+          .delete()
+          .eq('prescription_id', id)
+          .in('id', toDelete);
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('[PRESCRIPTIONS] patch error:', err);
     return res.status(500).json({
       ok: false,
       error: 'INTERNAL_ERROR',
