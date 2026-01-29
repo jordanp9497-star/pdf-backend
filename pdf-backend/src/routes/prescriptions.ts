@@ -225,8 +225,9 @@ router.post(
 
     const { data: profile, error: profileError } = await supabaseAdmin
       .from('profiles')
-      .select('id, owner_user_id')
+      .select('id')
       .eq('id', profileId)
+      .eq('owner_user_id', userId)
       .maybeSingle();
 
     if (profileError) {
@@ -240,20 +241,10 @@ router.post(
     }
 
     if (!profile) {
-      return res.status(400).json({
-        ok: false,
-        error: 'PROFILE_NOT_FOUND',
-        message: 'Profil introuvable',
-        profileId,
-        traceId,
-      });
-    }
-
-    if (profile.owner_user_id !== userId) {
       return res.status(403).json({
         ok: false,
         error: 'PROFILE_FORBIDDEN',
-        message: 'Vous n\'avez pas accès à ce profil',
+        message: 'Profil introuvable ou vous n\'avez pas accès à ce profil',
         profileId,
         traceId,
       });
@@ -362,6 +353,7 @@ router.post(
     const stepPrescriptionsInsert = 'prescriptions_insert';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepPrescriptionsInsert });
 
+    // Toutes les clés possibles (date_ordonnance, medecin_*, patient_*, etc.)
     const prescriptionRow: Record<string, unknown> = {
       id: prescriptionId,
       owner_user_id: userId,
@@ -376,6 +368,7 @@ router.post(
       patient_prenom: patient?.prenom ?? null,
       patient_date_naissance: patient?.date_naissance ?? null,
     };
+    // Enlever undefined/null et ne garder que les clés avec valeur (évite colonnes absentes)
     const insertPayload: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(prescriptionRow)) {
       if (v !== undefined && v !== null) {
@@ -398,7 +391,8 @@ router.post(
       });
       if (e.code === 'PGRST204' || String(e.message ?? '').includes('not found in schema cache')) {
         const columnMatch = String(e.message ?? '').match(/'([^']+)'/);
-        const columnHint = columnMatch ? columnMatch[1] : 'date_ordonnance';
+        const columnHint = columnMatch ? columnMatch[1] : 'unknown';
+        console.error('[PRESCRIPTIONS] import-pdf PGRST204 insertPayload keys', { traceId, keys: Object.keys(insertPayload) });
         return res.status(500).json({
           ok: false,
           error: 'SCHEMA_CACHE_OUTDATED',
@@ -411,7 +405,7 @@ router.post(
         error: 'DB_INSERT_FAILED',
         step: stepPrescriptionsInsert,
         code: e.code ?? null,
-        message: e.message ?? 'Erreur insert prescriptions',
+        message: e.message ?? null,
         details: e.details ?? null,
         hint: e.hint ?? null,
         traceId,
