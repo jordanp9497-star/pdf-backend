@@ -28,6 +28,15 @@ import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
 
 const router = express.Router();
 
+/** Statuts autorisés par la contrainte prescriptions_status_check (Supabase). */
+export const PrescriptionStatus = {
+  PROCESSING: 'processing',
+  READY: 'ready',
+  MANUAL_REQUIRED: 'manual_required',
+  ERROR: 'error',
+} as const;
+export type PrescriptionStatusType = (typeof PrescriptionStatus)[keyof typeof PrescriptionStatus];
+
 const BUCKET = 'prescriptions';
 const UPLOAD_LIMIT = 10 * 1024 * 1024; // 10MB
 
@@ -184,7 +193,7 @@ router.post(
  * Entrée: multipart/form-data — file (obligatoire), profile_id ou profileId (body/query, obligatoire).
  * 1) Auth requireUser (req.userId)
  * 2) Upload fichier brut Supabase Storage (bucket prescriptions) via storageService
- * 3) Extraction texte : PDF => pdf-parse ; rawText nettoyé ; si vide ou < 30 chars => status needs_manual, raw_text null ; sinon draft + raw_text
+ * 3) Extraction texte : PDF => pdf-parse ; rawText nettoyé ; si vide ou < 30 chars => status needs_manual, raw_text null ; sinon pending_verification + raw_text
  * 4) Si rawText : OpenAI structuration → JSON validé zod ; fallback header null + items []
  * 5) Insert prescriptions, prescription_files, prescription_items
  * Réponse: 200 { ok, prescriptionId, status, extracted, itemsCount } | 422 NO_TEXT_IN_PDF | 400 MISSING_FILE / MISSING_PROFILE_ID
@@ -314,72 +323,24 @@ router.post(
       });
     }
 
-    let rawText = '';
-    if (contentType === 'application/pdf') {
-      try {
-        const parsed = await pdfParse(buffer);
-        rawText = (parsed.text || '').replace(/\s+/g, ' ').trim();
-      } catch {
-        rawText = '';
-      }
-    }
-
-    const prescriptionStatus = !rawText || rawText.length < 30 ? 'needs_manual' : 'draft';
-    const rawTextForDb = prescriptionStatus === 'draft' ? rawText : null;
-
-    let extracted: PrescriptionStruct = {
-      date_ordonnance: null,
-      medecin: null,
-      patient: null,
-      items: [],
-    };
-
-    if (rawText && rawText.length >= 30) {
-      const openaiKey =
-        process.env.OPENAI_API_KEY || (req.app?.locals && (req.app.locals as { OPENAI_API_KEY?: string }).OPENAI_API_KEY);
-      if (openaiKey) {
-        try {
-          extracted = await structurizePrescriptionText({ openaiApiKey: openaiKey, rawText });
-        } catch (err) {
-          console.error('[PRESCRIPTIONS] import-pdf OpenAI struct:', err);
-        }
-      }
-    }
-
-    const medecin = extracted.medecin;
-    const patient = extracted.patient;
-
     type SupabaseErrorLike = { code?: string; message?: string; details?: string; hint?: string };
     const stepPrescriptionsInsert = 'prescriptions_insert';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepPrescriptionsInsert });
 
-    // Toutes les clés possibles (user_id requis NOT NULL, owner_user_id, date_ordonnance, medecin_*, patient_*, etc.)
-    const prescriptionRow: Record<string, unknown> = {
+    const insertPayload: Record<string, unknown> = {
       id: prescriptionId,
       user_id: userId,
       owner_user_id: userId,
       profile_id: profileId,
-      status: prescriptionStatus,
-      raw_text: rawTextForDb,
-      date_ordonnance: extracted.date_ordonnance ?? null,
-      medecin_nom: medecin?.nom ?? null,
-      medecin_prenom: medecin?.prenom ?? null,
-      medecin_rpps: medecin?.rpps ?? null,
-      patient_nom: patient?.nom ?? null,
-      patient_prenom: patient?.prenom ?? null,
-      patient_date_naissance: patient?.date_naissance ?? null,
+      status: PrescriptionStatus.PROCESSING,
     };
-    // Enlever undefined/null et ne garder que les clés avec valeur (évite colonnes absentes)
-    const insertPayload: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(prescriptionRow)) {
-      if (v !== undefined && v !== null) {
-        insertPayload[k] = v;
-      }
-    }
-    console.log('[PRESCRIPTIONS] import-pdf insert prescriptions keys (no values)', { traceId, keys: Object.keys(insertPayload) });
+    console.log('[PRESCRIPTIONS] import-pdf insert prescriptions keys (no values)', {
+      traceId,
+      keys: Object.keys(insertPayload),
+      status: PrescriptionStatus.PROCESSING,
+    });
 
     const { error: prescError } = await supabaseAdmin.from('prescriptions').insert(insertPayload);
-
     if (prescError) {
       const e = prescError as SupabaseErrorLike;
       console.error('[PRESCRIPTIONS] import-pdf Supabase error', {
@@ -415,7 +376,6 @@ router.post(
 
     const stepFilesInsert = 'prescription_files_insert';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepFilesInsert });
-
     const { error: fileError } = await supabaseAdmin.from('prescription_files').insert({
       prescription_id: prescriptionId,
       bucket: BUCKET,
@@ -424,89 +384,159 @@ router.post(
       size,
       original_name: originalNameForDb,
     });
-
     if (fileError) {
       const e = fileError as SupabaseErrorLike;
-      console.error('[PRESCRIPTIONS] import-pdf Supabase error', {
-        traceId,
-        stepName: stepFilesInsert,
-        code: e.code,
-        message: e.message,
-        details: e.details,
-        hint: e.hint,
-      });
+      console.error('[PRESCRIPTIONS] import-pdf Supabase error', { traceId, stepName: stepFilesInsert, code: e.code, message: e.message });
+      await supabaseAdmin.from('prescriptions').update({ status: PrescriptionStatus.ERROR }).eq('id', prescriptionId);
       return res.status(500).json({
         ok: false,
         error: 'DB_INSERT_FAILED',
         step: stepFilesInsert,
         code: e.code ?? null,
-        message: e.message ?? 'Erreur insert prescription_files',
-        details: e.details ?? null,
-        hint: e.hint ?? null,
+        message: e.message ?? null,
         traceId,
       });
     }
 
-    const items = Array.isArray(extracted.items) ? extracted.items : [];
-    let itemsCount = 0;
-    const stepItemsInsert = 'prescription_items_insert';
-    if (items.length > 0) {
-      console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepItemsInsert });
-      const rows = items.slice(0, 500).map((item) => ({
-        prescription_id: prescriptionId,
-        nom: item.nom ?? null,
-        dosage: item.dosage ?? null,
-        forme: item.forme ?? null,
-        frequence_par_jour: item.frequence_par_jour ?? null,
-        moment: item.moment ?? null,
-        duree: item.duree ?? null,
-        instructions: item.instructions ?? null,
-      }));
-      const { error: itemsError } = await supabaseAdmin.from('prescription_items').insert(rows);
-      if (itemsError) {
-        const e = itemsError as SupabaseErrorLike;
-        console.error('[PRESCRIPTIONS] import-pdf Supabase error', {
-          traceId,
-          stepName: stepItemsInsert,
-          code: e.code,
-          message: e.message,
-          details: e.details,
-          hint: e.hint,
-        });
-        return res.status(500).json({
-          ok: false,
-          error: 'DB_INSERT_FAILED',
-          step: stepItemsInsert,
-          code: e.code ?? null,
-          message: e.message ?? 'Erreur insert prescription_items',
-          details: e.details ?? null,
-          hint: e.hint ?? null,
+    const setPrescriptionError = async () => {
+      await supabaseAdmin.from('prescriptions').update({ status: PrescriptionStatus.ERROR }).eq('id', prescriptionId);
+    };
+
+    try {
+      let rawText = '';
+      if (contentType === 'application/pdf') {
+        try {
+          const parsed = await pdfParse(buffer);
+          rawText = (parsed.text || '').replace(/\s+/g, ' ').trim();
+        } catch {
+          rawText = '';
+        }
+      }
+
+      const rawTextUsable = rawText && rawText.length >= 30;
+
+      if (!rawTextUsable) {
+        console.log('[PRESCRIPTIONS] import-pdf status utilisé', { traceId, status: PrescriptionStatus.MANUAL_REQUIRED });
+        await supabaseAdmin
+          .from('prescriptions')
+          .update({ status: PrescriptionStatus.MANUAL_REQUIRED, raw_text: null })
+          .eq('id', prescriptionId);
+        return res.status(200).json({
+          ok: true,
+          prescriptionId,
+          status: PrescriptionStatus.MANUAL_REQUIRED,
+          message: 'PDF scanné ou texte insuffisant ; saisie manuelle possible',
           traceId,
         });
       }
-      itemsCount = rows.length;
-    }
 
-    if (prescriptionStatus === 'needs_manual') {
-      return res.status(422).json({
+      let extracted: PrescriptionStruct = {
+        date_ordonnance: null,
+        medecin: null,
+        patient: null,
+        items: [],
+      };
+      const openaiKey =
+        process.env.OPENAI_API_KEY || (req.app?.locals && (req.app.locals as { OPENAI_API_KEY?: string }).OPENAI_API_KEY);
+      if (openaiKey) {
+        try {
+          extracted = await structurizePrescriptionText({ openaiApiKey: openaiKey, rawText });
+        } catch (err) {
+          console.error('[PRESCRIPTIONS] import-pdf OpenAI struct:', err);
+        }
+      }
+
+      const medecin = extracted.medecin;
+      const patient = extracted.patient;
+      console.log('[PRESCRIPTIONS] import-pdf status utilisé', { traceId, status: PrescriptionStatus.READY });
+
+      const updatePayload: Record<string, unknown> = {
+        status: PrescriptionStatus.READY,
+        raw_text: rawText,
+        date_ordonnance: extracted.date_ordonnance ?? null,
+        medecin_nom: medecin?.nom ?? null,
+        medecin_prenom: medecin?.prenom ?? null,
+        medecin_rpps: medecin?.rpps ?? null,
+        patient_nom: patient?.nom ?? null,
+        patient_prenom: patient?.prenom ?? null,
+        patient_date_naissance: patient?.date_naissance ?? null,
+      };
+      const updatePayloadFiltered: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(updatePayload)) {
+        if (v !== undefined && v !== null) updatePayloadFiltered[k] = v;
+      }
+      const { error: updateError } = await supabaseAdmin
+        .from('prescriptions')
+        .update(updatePayloadFiltered)
+        .eq('id', prescriptionId);
+      if (updateError) {
+        const e = updateError as SupabaseErrorLike;
+        console.error('[PRESCRIPTIONS] import-pdf update prescription error', { traceId, code: e.code, message: e.message });
+        await setPrescriptionError();
+        return res.status(500).json({
+          ok: false,
+          error: 'DB_INSERT_FAILED',
+          step: 'prescriptions_update',
+          code: e.code ?? null,
+          message: e.message ?? null,
+          traceId,
+        });
+      }
+
+      const items = Array.isArray(extracted.items) ? extracted.items : [];
+      let itemsCount = 0;
+      const stepItemsInsert = 'prescription_items_insert';
+      if (items.length > 0) {
+        console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepItemsInsert });
+        const rows = items.slice(0, 500).map((item) => ({
+          prescription_id: prescriptionId,
+          nom: item.nom ?? null,
+          dosage: item.dosage ?? null,
+          forme: item.forme ?? null,
+          frequence_par_jour: item.frequence_par_jour ?? null,
+          moment: item.moment ?? null,
+          duree: item.duree ?? null,
+          instructions: item.instructions ?? null,
+        }));
+        const { error: itemsError } = await supabaseAdmin.from('prescription_items').insert(rows);
+        if (itemsError) {
+          const e = itemsError as SupabaseErrorLike;
+          console.error('[PRESCRIPTIONS] import-pdf Supabase error', { traceId, stepName: stepItemsInsert, code: e.code, message: e.message });
+          await setPrescriptionError();
+          return res.status(500).json({
+            ok: false,
+            error: 'DB_INSERT_FAILED',
+            step: stepItemsInsert,
+            code: e.code ?? null,
+            message: e.message ?? null,
+            traceId,
+          });
+        }
+        itemsCount = rows.length;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        prescriptionId,
+        status: PrescriptionStatus.READY,
+        extracted: {
+          date_ordonnance: extracted.date_ordonnance,
+          medecin: extracted.medecin,
+          patient: extracted.patient,
+          itemsCount,
+        },
+        itemsCount,
+      });
+    } catch (err) {
+      console.error('[PRESCRIPTIONS] import-pdf exception', { traceId, error: err });
+      await setPrescriptionError();
+      return res.status(500).json({
         ok: false,
-        error: 'NO_TEXT_IN_PDF',
-        message: 'PDF scanné ou texte insuffisant ; saisie manuelle requise',
+        error: 'INTERNAL_ERROR',
+        message: err instanceof Error ? err.message : 'Erreur lors de l\'import',
+        traceId,
       });
     }
-
-    return res.status(200).json({
-      ok: true,
-      prescriptionId,
-      status: prescriptionStatus,
-      extracted: {
-        date_ordonnance: extracted.date_ordonnance,
-        medecin: extracted.medecin,
-        patient: extracted.patient,
-        itemsCount,
-      },
-      itemsCount,
-    });
   }
 );
 
@@ -661,7 +691,7 @@ router.get('/:id', requireUser, async (req: Request, res: Response) => {
  * Body JSON pour PATCH /api/prescriptions/:id (écran de vérification)
  */
 type PatchPrescriptionBody = {
-  status?: 'verified' | 'draft' | 'needs_manual';
+  status?: PrescriptionStatusType;
   date_ordonnance?: string | null;
   medecin?: { nom?: string | null; prenom?: string | null; rpps?: string | null };
   patient?: { nom?: string | null; prenom?: string | null; date_naissance?: string | null };
@@ -732,7 +762,17 @@ router.patch('/:id', requireUser, async (req: Request, res: Response) => {
     const body = (req.body || {}) as PatchPrescriptionBody;
 
     const updatePresc: Record<string, unknown> = {};
-    if (body.status !== undefined) updatePresc.status = body.status;
+    if (body.status !== undefined) {
+      const allowed = Object.values(PrescriptionStatus) as string[];
+      if (!allowed.includes(body.status)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'BAD_REQUEST',
+          message: `status doit être l'un de: ${allowed.join(', ')}`,
+        });
+      }
+      updatePresc.status = body.status;
+    }
     if (body.date_ordonnance !== undefined) updatePresc.date_ordonnance = body.date_ordonnance ?? null;
     if (body.medecin !== undefined) {
       updatePresc.medecin_nom = body.medecin.nom ?? null;
