@@ -1,6 +1,7 @@
 /**
  * Routes pour la gestion des abonnements Stripe
- * 
+ *
+ * GET /billing/me - Entitlements / premium (plan, pregnancy_pack_enabled)
  * POST /billing/create-checkout-session - Créer une session de checkout Stripe
  * POST /billing/webhook - Webhook Stripe pour mettre à jour les abonnements
  */
@@ -10,6 +11,8 @@ import { authenticateSupabase } from '../middlewares/auth.js';
 import { stripe } from '../src/lib/stripe.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
 import { STRIPE_CONFIG, APP_CONFIG } from '../src/config/env.js';
+import { getPlanLimits } from '../src/lib/planLimits.js';
+import { isFeatureEnabled } from '../src/services/features.js';
 
 const router = express.Router();
 
@@ -25,6 +28,51 @@ const PREMIUM_PRICE_ID = 'price_1SsTI3L9JokDSsqLuZralNuv';
  * @param {string} userId - ID de l'utilisateur
  * @returns {Promise<boolean>} - true si l'utilisateur a un abonnement actif
  */
+/**
+ * GET /billing/me
+ *
+ * Retourne entitlements / premium pour l'utilisateur authentifié.
+ * pregnancy_pack_enabled = (entitlement normal isPro) OR feature override 'pregnancy_pack'.
+ */
+router.get('/me', authenticateSupabase, async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id;
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise',
+      });
+    }
+    const limits = await getPlanLimits(userId);
+    const overridePregnancy = await isFeatureEnabled(userId, 'pregnancy_pack');
+    const pregnancy_pack_enabled = limits.isPro || overridePregnancy;
+
+    if (overridePregnancy && process.env.NODE_ENV !== 'production') {
+      console.log('[BILLING] pregnancy_pack override enabled');
+    }
+
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+    });
+    res.status(200).json({
+      ok: true,
+      plan: limits.isPro ? 'PREMIUM' : 'FREE',
+      isPro: limits.isPro,
+      pregnancy_pack_enabled,
+    });
+  } catch (err) {
+    console.error('[BILLING] GET /me error:', err);
+    res.status(500).json({
+      ok: false,
+      error: 'INTERNAL_ERROR',
+      message: 'Erreur serveur',
+    });
+  }
+});
+
 export async function isSubscribed(userId) {
   if (!supabase || !userId) {
     return false;

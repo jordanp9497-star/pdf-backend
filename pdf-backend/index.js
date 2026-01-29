@@ -196,6 +196,11 @@ import prescriptionsRouter from './src/routes/prescriptions.js';
 app.use('/api/prescriptions', prescriptionsRouter);
 console.log('[PRESCRIPTIONS] routes mounted (GET /api/prescriptions, GET /api/prescriptions/:id, PATCH /api/prescriptions/:id, POST /api/prescriptions/import, POST /api/prescriptions/import-pdf, POST /api/prescriptions/import-pdf/debug)');
 
+// ===== ROUTES CHILDREN (CRUD enfants, owner_user_id = auth user) =====
+import childrenRouter from './routes/children.routes.js';
+app.use('/api/children', childrenRouter);
+console.log('[CHILDREN] routes mounted (GET/POST /api/children, GET/PATCH/DELETE /api/children/:id)');
+
 // ===== ROUTES DEVICES =====
 import devicesRouter from './routes/devices.routes.js';
 app.use('/devices', devicesRouter);

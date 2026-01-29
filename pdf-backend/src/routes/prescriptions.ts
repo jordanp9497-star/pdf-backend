@@ -1208,6 +1208,26 @@ router.get('/:id', requireUser, async (req: Request, res: Response) => {
   }
 });
 
+/** Valeurs autorisées pour document_kind (classification document) */
+const DOCUMENT_KIND_VALUES = ['medicament', 'rdv', 'biologie', 'compte_rendu', 'imagerie', 'certificat', 'autre'] as const;
+export type DocumentKindType = (typeof DOCUMENT_KIND_VALUES)[number];
+
+/** Valeurs autorisées pour doc_context */
+const DOC_CONTEXT_VALUES = ['general', 'pregnancy', 'child'] as const;
+export type DocContextType = (typeof DOC_CONTEXT_VALUES)[number];
+
+function isDocumentKind(v: unknown): v is DocumentKindType {
+  return typeof v === 'string' && DOCUMENT_KIND_VALUES.includes(v as DocumentKindType);
+}
+function isDocContext(v: unknown): v is DocContextType {
+  return typeof v === 'string' && DOC_CONTEXT_VALUES.includes(v as DocContextType);
+}
+function isPregnancyMonth(v: unknown): v is number | null {
+  if (v === null || v === undefined) return true;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 1 && n <= 9;
+}
+
 /**
  * Body JSON pour PATCH /api/prescriptions/:id (écran de vérification)
  */
@@ -1216,6 +1236,9 @@ type PatchPrescriptionBody = {
   date_ordonnance?: string | null;
   medecin?: { nom?: string | null; prenom?: string | null; rpps?: string | null };
   patient?: { nom?: string | null; prenom?: string | null; date_naissance?: string | null };
+  document_kind?: string | null;
+  doc_context?: string | null;
+  pregnancy_month?: number | null;
   items?: Array<{
     id?: string;
     nom: string;
@@ -1232,9 +1255,9 @@ type PatchPrescriptionBody = {
  * PATCH /api/prescriptions/:id
  *
  * Sauvegarde écran de vérification. Auth requireUser.
- * Update prescriptions (status, date_ordonnance, medecin_*, patient_*).
+ * Update prescriptions (status, date_ordonnance, medecin_*, patient_*, document_kind, doc_context, pregnancy_month).
  * Upsert items : item.id présent => update, sinon insert ; supprimer les items absents de la liste si items fourni.
- * Retour: { ok: true }
+ * Retour: { ok: true, prescription } (objet prescription mis à jour).
  */
 router.patch('/:id', requireUser, async (req: Request, res: Response) => {
   try {
@@ -1305,7 +1328,42 @@ router.patch('/:id', requireUser, async (req: Request, res: Response) => {
       updatePresc.patient_date_naissance = body.patient.date_naissance ?? null;
     }
 
+    // Classification document (document_kind, doc_context, pregnancy_month)
+    if (body.document_kind !== undefined) {
+      if (body.document_kind !== null && body.document_kind !== '' && !isDocumentKind(body.document_kind)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'BAD_REQUEST',
+          message: `document_kind doit être l'un de: ${DOCUMENT_KIND_VALUES.join(', ')}`,
+        });
+      }
+      updatePresc.document_kind = body.document_kind === '' ? null : (body.document_kind ?? null);
+    }
+    if (body.doc_context !== undefined) {
+      if (body.doc_context !== null && body.doc_context !== '' && !isDocContext(body.doc_context)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'BAD_REQUEST',
+          message: `doc_context doit être l'un de: ${DOC_CONTEXT_VALUES.join(', ')}`,
+        });
+      }
+      updatePresc.doc_context = body.doc_context === '' ? null : (body.doc_context ?? null);
+    }
+    if (body.pregnancy_month !== undefined) {
+      if (!isPregnancyMonth(body.pregnancy_month)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'BAD_REQUEST',
+          message: 'pregnancy_month doit être null ou un entier entre 1 et 9',
+        });
+      }
+      updatePresc.pregnancy_month = body.pregnancy_month ?? null;
+    }
+
     if (Object.keys(updatePresc).length > 0) {
+      if (updatePresc.document_kind !== undefined || updatePresc.doc_context !== undefined || updatePresc.pregnancy_month !== undefined) {
+        console.log('[PRESCRIPTIONS] patch classification', { id, document_kind: updatePresc.document_kind, doc_context: updatePresc.doc_context, pregnancy_month: updatePresc.pregnancy_month });
+      }
       const { error: updateError } = await supabaseAdmin
         .from('prescriptions')
         .update(updatePresc)
@@ -1376,7 +1434,17 @@ router.patch('/:id', requireUser, async (req: Request, res: Response) => {
       }
     }
 
-    return res.status(200).json({ ok: true });
+    const { data: updatedPrescription, error: fetchError } = await supabaseAdmin
+      .from('prescriptions')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !updatedPrescription) {
+      console.error('[PRESCRIPTIONS] patch fetch updated:', fetchError);
+      return res.status(200).json({ ok: true });
+    }
+    return res.status(200).json({ ok: true, prescription: updatedPrescription });
   } catch (err) {
     console.error('[PRESCRIPTIONS] patch error:', err);
     return res.status(500).json({
