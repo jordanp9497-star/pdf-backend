@@ -22,6 +22,7 @@ import {
   createSignedUrl,
   isBucketNotFoundError,
   getPrescriptionStoragePathDeterministic,
+  getPhotoStoragePath,
   normalizeOriginalFilename,
 } from '../services/storageService.js';
 import { structurizePrescriptionText } from '../services/prescriptionStructService.js';
@@ -83,6 +84,17 @@ const uploadImportPdf = multer({
     filename: (_req, _file, cb) => cb(null, safeTmpFilename()),
   }),
   limits: { fileSize: UPLOAD_LIMIT },
+});
+
+const PHOTO_UPLOAD_LIMIT = 10 * 1024 * 1024; // 10MB
+/** Multer pour import-photo : champ "file", image/jpeg (ou image/png), 10MB. */
+const uploadImportPhoto = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: PHOTO_UPLOAD_LIMIT },
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|jpg|png)$/.test(file.mimetype || '');
+    cb(null, ok);
+  },
 });
 
 export type TmpFileInfo = {
@@ -648,6 +660,393 @@ router.post(
           ok: false,
           error: 'INTERNAL_ERROR',
           message: err instanceof Error ? err.message : 'Erreur lors de l\'import',
+          traceId,
+        });
+      }
+    }
+  }
+);
+
+const LOG_PREFIX_PHOTO = '[PRESCRIPTIONS][import-photo]';
+const OPENAI_TIMEOUT_MS_PHOTO = 15000;
+const MISTRAL_OCR_TIMEOUT_MS = 45000;
+const OPENAI_OCR_TIMEOUT_MS = 45000;
+
+/**
+ * OCR image via Mistral vision API. Retourne le texte brut ou '' si échec / pas de clé.
+ */
+async function ocrImageWithMistral(buffer: Buffer, mimeType: string, traceId: string): Promise<string> {
+  const key = process.env.MISTRAL_API_KEY;
+  if (!key) {
+    console.log(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] MISTRAL_API_KEY absent`);
+    return '';
+  }
+  const base64 = buffer.toString('base64');
+  const dataUrl = `data:${mimeType};base64,${base64}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MISTRAL_OCR_TIMEOUT_MS);
+  try {
+    const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'mistral-large-latest',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut sans commentaire.' },
+              { type: 'image_url', image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      console.error(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] Mistral status`, res.status);
+      return '';
+    }
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const text = data?.choices?.[0]?.message?.content ?? '';
+    return (text || '').replace(/\s+/g, ' ').trim();
+  } catch (e) {
+    clearTimeout(timeoutId);
+    console.error(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] Mistral`, e);
+    return '';
+  }
+}
+
+/**
+ * Fallback OCR via OpenAI Vision (image base64 -> texte brut FR). Retourne '' si échec / pas de clé.
+ */
+async function ocrImageWithOpenAIVision(buffer: Buffer, mimeType: string, traceId: string): Promise<string> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    console.log(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] OPENAI_API_KEY absent (fallback Vision)`);
+    return '';
+  }
+  const base64 = buffer.toString('base64');
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENAI_OCR_TIMEOUT_MS);
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        max_tokens: 4096,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut, sans commentaire.' },
+              {
+                type: 'image_url',
+                image_url: { url: `data:${mimeType};base64,${base64}` },
+              },
+            ],
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      console.error(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] OpenAI Vision status`, res.status);
+      return '';
+    }
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const text = data?.choices?.[0]?.message?.content ?? '';
+    return (text || '').replace(/\s+/g, ' ').trim();
+  } catch (e) {
+    clearTimeout(timeoutId);
+    console.error(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] OpenAI Vision`, e);
+    return '';
+  }
+}
+
+/**
+ * OCR image : Mistral d'abord, fallback OpenAI Vision si vide.
+ */
+async function ocrImage(buffer: Buffer, mimeType: string, traceId: string): Promise<string> {
+  let rawText = await ocrImageWithMistral(buffer, mimeType, traceId);
+  if (!rawText || rawText.length < 20) {
+    console.log(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] fallback OpenAI Vision`);
+    rawText = await ocrImageWithOpenAIVision(buffer, mimeType, traceId);
+  }
+  return (rawText || '').trim();
+}
+
+/**
+ * Traitement en background après réponse HTTP : OCR + parse, update prescriptions + prescription_items.
+ */
+function processPrescriptionPhoto(params: {
+  prescriptionId: string;
+  userId: string;
+  profileId: string;
+  buffer: Buffer;
+  mimeType: string;
+  traceId: string;
+}): void {
+  const { prescriptionId, userId, profileId, buffer, mimeType, traceId } = params;
+  const step = (name: string) => `${LOG_PREFIX_PHOTO}[${traceId}][${name}]`;
+
+  const setError = async (stepName: string, err: unknown) => {
+    try {
+      console.error(step(stepName), err);
+      await supabaseAdmin
+        .from('prescriptions')
+        .update({ status: PrescriptionStatus.ERROR, data: { error: String(err instanceof Error ? err.message : err), step: stepName } })
+        .eq('id', prescriptionId);
+    } catch (e) {
+      console.error(step('setError'), e);
+    }
+  };
+
+  setImmediate(async () => {
+    try {
+      // 1) OCR -> raw_text (Mistral puis fallback OpenAI Vision)
+      console.log(step('ocr'));
+      const rawText = await ocrImage(buffer, mimeType, traceId);
+      if (!rawText || rawText.length < 30) {
+        console.log(step('manual_required'), 'rawText vide ou < 30');
+        await supabaseAdmin
+          .from('prescriptions')
+          .update({ status: PrescriptionStatus.MANUAL_REQUIRED, raw_text: null, data: { source: 'photo', extraction: 'empty' } })
+          .eq('id', prescriptionId);
+        return;
+      }
+
+      // 2) Sauver raw_text dans prescriptions (on le met dans l'update final)
+      // 3) Parser raw_text (médecin/patient/date + items) via GPT JSON
+      console.log(step('parse_ai'));
+      let extracted: PrescriptionStruct = { date_ordonnance: null, medecin: null, patient: null, items: [] };
+      const openaiKey = process.env.OPENAI_API_KEY;
+      if (openaiKey) {
+        try {
+          const timeoutPromise = new Promise<PrescriptionStruct>((_, reject) =>
+            setTimeout(() => reject(new Error('OPENAI_TIMEOUT')), OPENAI_TIMEOUT_MS_PHOTO)
+          );
+          extracted = await Promise.race([
+            structurizePrescriptionText({ openaiApiKey: openaiKey, rawText }),
+            timeoutPromise,
+          ]);
+        } catch (e) {
+          console.error(step('parse_ai'), e);
+          // Parse échoue => manual_required mais on sauve raw_text
+          await supabaseAdmin
+            .from('prescriptions')
+            .update({
+              status: PrescriptionStatus.MANUAL_REQUIRED,
+              raw_text: rawText,
+              data: { source: 'photo', error: 'ai_failed' },
+            })
+            .eq('id', prescriptionId);
+          return;
+        }
+      }
+
+      const prescriptionData = {
+        date_ordonnance: extracted.date_ordonnance ?? null,
+        medecin: extracted.medecin ?? null,
+        patient: extracted.patient ?? null,
+        items: extracted.items ?? [],
+      };
+      const items = Array.isArray(extracted.items) ? extracted.items : [];
+
+      // 4) Insert prescription_items : uniquement colonnes existantes (prescription_id, user_id, profile_id, idx, label, raw_line, data)
+      if (items.length > 0) {
+        console.log(step('prescription_items_insert'));
+        type ItemLike = { nom?: string | null; label?: string | null; raw_line?: string | null; [k: string]: unknown };
+        const rows = items.slice(0, 500).map((item: ItemLike, index: number) => ({
+          prescription_id: prescriptionId,
+          user_id: userId,
+          profile_id: profileId,
+          idx: index,
+          label: item.nom ?? item.label ?? null,
+          raw_line: item.raw_line ?? null,
+          data: item as Record<string, unknown>,
+        }));
+        const { error: itemsErr } = await supabaseAdmin.from('prescription_items').insert(rows);
+        if (itemsErr) {
+          await setError('prescription_items_insert', itemsErr);
+          return;
+        }
+      }
+
+      // 5) Update prescriptions : raw_text toujours sauvegardé ; status = 'ready' si au moins 1 item, sinon 'manual_required'
+      const finalStatus = items.length >= 1 ? PrescriptionStatus.READY : PrescriptionStatus.MANUAL_REQUIRED;
+      console.log(step('prescriptions_update'), finalStatus);
+      const { error: updateErr } = await supabaseAdmin
+        .from('prescriptions')
+        .update({
+          status: finalStatus,
+          raw_text: rawText,
+          data: prescriptionData,
+        })
+        .eq('id', prescriptionId);
+      if (updateErr) {
+        await setError('prescriptions_update', updateErr);
+        return;
+      }
+      console.log(step('done'), finalStatus);
+    } catch (err) {
+      console.error(step('exception'), err);
+      setError('exception', err).catch((e) => console.error(step('setError'), e));
+    }
+  });
+}
+
+/**
+ * POST /api/prescriptions/import-photo
+ *
+ * Multipart: profile_id (string), file (image/jpeg). Auth Bearer obligatoire.
+ * Réponse immédiate { ok: true, prescriptionId, status: 'processing' }. OCR+parse en background (setImmediate).
+ */
+router.post(
+  '/import-photo',
+  requireUser,
+  uploadImportPhoto.single('file'),
+  async (req: Request, res: Response) => {
+    const traceId = randomUUID();
+    type ReqWithUser = Request & { userId?: string; user?: { id: string } };
+    const reqUser = req as ReqWithUser;
+    const userId = reqUser.userId ?? reqUser.user?.id;
+
+    try {
+      console.log(`${LOG_PREFIX_PHOTO}[${traceId}][start]`);
+
+      if (!userId) {
+        return res.status(401).json({ ok: false, error: 'UNAUTHORIZED', message: 'Authentification requise' });
+      }
+
+      const profileIdRaw = req.body?.profile_id;
+      const profileId = typeof profileIdRaw === 'string' ? profileIdRaw.trim() : '';
+      if (!profileId) {
+        return res.status(400).json({ ok: false, error: 'MISSING_PROFILE_ID', message: 'Le champ profile_id est obligatoire', traceId });
+      }
+
+      const { data: profile, error: profileError } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('id', profileId)
+        .eq('owner_user_id', userId)
+        .maybeSingle();
+
+      if (profileError) {
+        console.error(`${LOG_PREFIX_PHOTO}[${traceId}][profile_fetch]`, profileError);
+        return res.status(500).json({ ok: false, error: 'DB_ERROR', message: profileError.message ?? 'Erreur profil', traceId });
+      }
+      if (!profile) {
+        return res.status(403).json({ ok: false, error: 'PROFILE_FORBIDDEN', message: 'Profil introuvable ou accès refusé', profileId, traceId });
+      }
+
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ ok: false, error: 'MISSING_FILE', message: 'Le champ fichier "file" est obligatoire', traceId });
+      }
+
+      const buffer = req.file.buffer as Buffer;
+      const originalname = req.file.originalname ?? 'photo.jpg';
+      const mimetype = req.file.mimetype ?? 'image/jpeg';
+      const size = buffer.length;
+
+      console.log(`${LOG_PREFIX_PHOTO}[${traceId}][file]`, { originalname, mimetype, size });
+
+      const prescriptionId = randomUUID();
+      const storagePath = getPhotoStoragePath(profileId, prescriptionId, originalname);
+      if (!storagePath || !storagePath.trim()) {
+        return res.status(500).json({ ok: false, error: 'INTERNAL_ERROR', message: 'storage_path vide', traceId });
+      }
+
+      console.log(`${LOG_PREFIX_PHOTO}[${traceId}][storage_upload]`);
+      try {
+        await uploadBufferToStorage({ bucket: BUCKET, path: storagePath, buffer, contentType: mimetype });
+      } catch (storageErr: unknown) {
+        console.error(`${LOG_PREFIX_PHOTO}[${traceId}][storage_upload]`, storageErr);
+        if (isBucketNotFoundError(storageErr)) {
+          return res.status(500).json({
+            ok: false,
+            error: 'BUCKET_NOT_FOUND',
+            message: 'Bucket Storage "prescriptions" introuvable',
+            traceId,
+          });
+        }
+        return res.status(500).json({
+          ok: false,
+          error: 'STORAGE_UPLOAD_FAILED',
+          message: storageErr instanceof Error ? storageErr.message : 'Upload échoué',
+          traceId,
+        });
+      }
+
+      console.log(`${LOG_PREFIX_PHOTO}[${traceId}][prescriptions_insert]`);
+      const insertPayload: Record<string, unknown> = {
+        id: prescriptionId,
+        user_id: userId,
+        owner_user_id: userId,
+        profile_id: profileId,
+        status: PrescriptionStatus.PROCESSING,
+      };
+      const { error: prescError } = await supabaseAdmin.from('prescriptions').insert(insertPayload);
+      if (prescError) {
+        console.error(`${LOG_PREFIX_PHOTO}[${traceId}][prescriptions_insert]`, prescError);
+        return res.status(500).json({
+          ok: false,
+          error: 'DB_INSERT_FAILED',
+          step: 'prescriptions_insert',
+          message: prescError.message ?? null,
+          traceId,
+        });
+      }
+
+      console.log(`${LOG_PREFIX_PHOTO}[${traceId}][prescription_files_insert]`);
+      const filesPayload: Record<string, unknown> = {
+        prescription_id: prescriptionId,
+        profile_id: profileId,
+        user_id: userId,
+        storage_path: storagePath,
+        mime_type: mimetype,
+        size_bytes: size,
+        original_name: originalname,
+        meta: { kind: 'photo', source: 'photo' },
+      };
+      const { error: fileError } = await supabaseAdmin.from('prescription_files').insert(filesPayload);
+      if (fileError) {
+        console.error(`${LOG_PREFIX_PHOTO}[${traceId}][prescription_files_insert]`, fileError);
+        await supabaseAdmin.from('prescriptions').update({ status: PrescriptionStatus.ERROR }).eq('id', prescriptionId);
+        return res.status(500).json({
+          ok: false,
+          error: 'DB_INSERT_FAILED',
+          step: 'prescription_files_insert',
+          message: fileError.message ?? null,
+          traceId,
+        });
+      }
+
+      res.status(200).json({ ok: true, prescriptionId, status: PrescriptionStatus.PROCESSING, traceId });
+
+      setImmediate(() => {
+        processPrescriptionPhoto({
+          prescriptionId,
+          userId,
+          profileId,
+          buffer,
+          mimeType: mimetype,
+          traceId,
+        });
+      });
+    } catch (err) {
+      console.error(`${LOG_PREFIX_PHOTO}[${traceId}][sync_error]`, err);
+      if (!res.headersSent) {
+        res.status(500).json({
+          ok: false,
+          error: 'INTERNAL_ERROR',
+          message: err instanceof Error ? err.message : 'Erreur import photo',
           traceId,
         });
       }

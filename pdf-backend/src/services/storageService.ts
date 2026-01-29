@@ -168,6 +168,23 @@ export function getPrescriptionFileStoragePath(
 }
 
 /**
+ * Path Storage pour import-photo (image).
+ * Format: profiles/{profileId}/prescriptions/{prescriptionId}/{timestamp}_{safeOriginalname}
+ * Toujours non vide (prescription_files.storage_path NOT NULL).
+ */
+export function getPhotoStoragePath(
+  profileId: string,
+  prescriptionId: string,
+  originalName: string
+): string {
+  let safe = originalName.trim() || 'photo.jpg';
+  safe = safe.normalize('NFD').replace(/\p{Mark}/gu, '');
+  safe = safe.replace(/[\s/\\]+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_') || 'photo';
+  if (!/\.(jpe?g|png|webp)$/i.test(safe)) safe += '.jpg';
+  return `profiles/${profileId}/prescriptions/${prescriptionId}/${Date.now()}_${safe}`;
+}
+
+/**
  * Chemin Storage DÉTERMINISTE pour import-pdf (pas dépendant de la réponse).
  * Format: ${userId}/${profileId}/${prescriptionId}/${safeFilename}
  * Toujours non vide.
