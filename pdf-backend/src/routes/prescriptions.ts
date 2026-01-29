@@ -2,9 +2,9 @@
  * Routes prescriptions – import ordonnance PDF
  *
  * Tables Supabase:
- * - prescriptions (owner_user_id, profile_id, status, raw_text, date_ordonnance, medecin_*, patient_*)
- * - prescription_files (prescription_id, profile_id, user_id, owner_user_id, bucket, storage_path, original_name, mime_type, size)
- * - prescription_items (prescription_id + nom, dosage, forme, …)
+ * - prescriptions (user_id, profile_id, status, raw_text, data JSONB)
+ * - prescription_files (prescription_id, user_id, profile_id, storage_path NOT NULL, mime_type, size_bytes, meta — pas de bucket/original_name si colonnes incertaines)
+ * - prescription_items (prescription_id, user_id, profile_id, idx, label, raw_line, data JSONB — pas de colonnes dosage/duree/etc.)
  *
  * Monté sur /api/prescriptions
  */
@@ -19,8 +19,7 @@ import {
   uploadBufferToStorage,
   createSignedUrl,
   isBucketNotFoundError,
-  normalizeOriginalFilename,
-  getPrescriptionFileStoragePath,
+  getPrescriptionStoragePathDeterministic,
 } from '../services/storageService.js';
 import { structurizePrescriptionText } from '../services/prescriptionStructService.js';
 import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
@@ -55,7 +54,7 @@ export function isPrescriptionStatus(value: unknown): value is PrescriptionStatu
   return typeof value === 'string' && PRESCRIPTION_STATUS_VALUES.includes(value as PrescriptionStatusType);
 }
 
-const BUCKET = 'prescriptions';
+const BUCKET = process.env.PRESCRIPTIONS_BUCKET || 'prescriptions';
 const UPLOAD_LIMIT = 10 * 1024 * 1024; // 10MB
 
 const uploadPdf = multer({
@@ -297,7 +296,8 @@ router.post(
     const size = buffer.length;
     const originalNameForDb = normalizeOriginalFilename(req.file.originalname || 'document.pdf');
     const prescriptionId = randomUUID();
-    const storagePath = getPrescriptionFileStoragePath(profileId, prescriptionId, originalNameForDb);
+    // storagePath calculé AVANT upload, puis réutilisé pour l'insert prescription_files (NOT NULL).
+    const storagePath = getPrescriptionStoragePathDeterministic(userId, profileId, prescriptionId, originalNameForDb);
     if (!storagePath || !storagePath.trim()) {
       return res.status(500).json({
         ok: false,
@@ -346,12 +346,15 @@ router.post(
     const stepPrescriptionsInsert = 'prescriptions_insert';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepPrescriptionsInsert });
 
+    // Toujours 'processing' à la création (jamais 'draft' pendant l'import).
     const insertPayload: Record<string, unknown> = {
       id: prescriptionId,
       user_id: userId,
       owner_user_id: userId,
       profile_id: profileId,
       status: PrescriptionStatus.PROCESSING,
+      raw_text: null,
+      data: {},
     };
     console.log('[PRESCRIPTIONS] import-pdf insert prescriptions keys (no values)', {
       traceId,
@@ -395,21 +398,32 @@ router.post(
 
     const stepFilesInsert = 'prescription_files_insert';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepFilesInsert });
-    const { error: fileError } = await supabaseAdmin.from('prescription_files').insert({
+    // storage_path NON NULL (calculé avant upload). Pas de bucket/original_name si colonnes incertaines.
+    const filesInsertPayload: Record<string, unknown> = {
       prescription_id: prescriptionId,
-      profile_id: profileId,
       user_id: userId,
-      owner_user_id: userId,
-      bucket: BUCKET,
+      profile_id: profileId,
       storage_path: storagePath,
-      original_name: originalNameForDb,
       mime_type: contentType,
-      size,
-    });
+      size_bytes: size,
+      meta: { source: 'pdf' },
+    };
+    const { error: fileError } = await supabaseAdmin.from('prescription_files').insert(filesInsertPayload);
     if (fileError) {
       const e = fileError as SupabaseErrorLike;
       console.error('[PRESCRIPTIONS] import-pdf Supabase error', { traceId, stepName: stepFilesInsert, code: e.code, message: e.message });
       await supabaseAdmin.from('prescriptions').update({ status: PrescriptionStatus.ERROR }).eq('id', prescriptionId);
+      if (e.code === 'PGRST204' || String(e.message ?? '').includes('not found in schema cache')) {
+        const columnMatch = String(e.message ?? '').match(/'([^']+)'/);
+        const columnHint = columnMatch ? columnMatch[1] : 'unknown';
+        return res.status(500).json({
+          ok: false,
+          error: 'SCHEMA_CACHE_OUTDATED',
+          step: stepFilesInsert,
+          message: `Colonne manquante/${columnHint}`,
+          traceId,
+        });
+      }
       return res.status(500).json({
         ok: false,
         error: 'DB_INSERT_FAILED',
@@ -425,6 +439,8 @@ router.post(
     };
 
     try {
+      const stepExtractText = 'extract_text';
+      console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepExtractText });
       let rawText = '';
       if (contentType === 'application/pdf') {
         try {
@@ -441,17 +457,23 @@ router.post(
         console.log('[PRESCRIPTIONS] import-pdf status utilisé', { traceId, status: PrescriptionStatus.MANUAL_REQUIRED });
         await supabaseAdmin
           .from('prescriptions')
-          .update({ status: PrescriptionStatus.MANUAL_REQUIRED, raw_text: null })
+          .update({
+            status: PrescriptionStatus.MANUAL_REQUIRED,
+            raw_text: null,
+            data: { source: 'pdf', extraction: 'empty' },
+          })
           .eq('id', prescriptionId);
         return res.status(200).json({
           ok: true,
           prescriptionId,
           status: PrescriptionStatus.MANUAL_REQUIRED,
-          message: 'PDF scanné ou texte insuffisant ; saisie manuelle possible',
-          traceId,
+          rawTextPreview: '',
+          data: { source: 'pdf', extraction: 'empty' },
         });
       }
 
+      const stepParseAi = 'parse_ai';
+      console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepParseAi });
       let extracted: PrescriptionStruct = {
         date_ordonnance: null,
         medecin: null,
@@ -468,63 +490,36 @@ router.post(
         }
       }
 
-      const medecin = extracted.medecin;
-      const patient = extracted.patient;
-      console.log('[PRESCRIPTIONS] import-pdf status utilisé', { traceId, status: PrescriptionStatus.READY });
-
-      const updatePayload: Record<string, unknown> = {
-        status: PrescriptionStatus.READY,
-        raw_text: rawText,
-        date_ordonnance: extracted.date_ordonnance ?? null,
-        medecin_nom: medecin?.nom ?? null,
-        medecin_prenom: medecin?.prenom ?? null,
-        medecin_rpps: medecin?.rpps ?? null,
-        patient_nom: patient?.nom ?? null,
-        patient_prenom: patient?.prenom ?? null,
-        patient_date_naissance: patient?.date_naissance ?? null,
-      };
-      const updatePayloadFiltered: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(updatePayload)) {
-        if (v !== undefined && v !== null) updatePayloadFiltered[k] = v;
-      }
-      const { error: updateError } = await supabaseAdmin
-        .from('prescriptions')
-        .update(updatePayloadFiltered)
-        .eq('id', prescriptionId);
-      if (updateError) {
-        const e = updateError as SupabaseErrorLike;
-        console.error('[PRESCRIPTIONS] import-pdf update prescription error', { traceId, code: e.code, message: e.message });
-        await setPrescriptionError();
-        return res.status(500).json({
-          ok: false,
-          error: 'DB_INSERT_FAILED',
-          step: 'prescriptions_update',
-          code: e.code ?? null,
-          message: e.message ?? null,
-          traceId,
-        });
-      }
-
       const items = Array.isArray(extracted.items) ? extracted.items : [];
-      let itemsCount = 0;
       const stepItemsInsert = 'prescription_items_insert';
       if (items.length > 0) {
         console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepItemsInsert });
-        const rows = items.slice(0, 500).map((item) => ({
+        // Aucun champ dynamique (dosage/duree/frequence_par_jour/etc.) : uniquement data (JSONB) + label/raw_line/idx.
+        const rows = items.slice(0, 500).map((item, index) => ({
           prescription_id: prescriptionId,
-          nom: item.nom ?? null,
-          dosage: item.dosage ?? null,
-          forme: item.forme ?? null,
-          frequence_par_jour: item.frequence_par_jour ?? null,
-          moment: item.moment ?? null,
-          duree: item.duree ?? null,
-          instructions: item.instructions ?? null,
+          user_id: userId,
+          profile_id: profileId,
+          idx: index,
+          label: (item as { nom?: string | null }).nom ?? '',
+          raw_line: '',
+          data: item as Record<string, unknown>,
         }));
         const { error: itemsError } = await supabaseAdmin.from('prescription_items').insert(rows);
         if (itemsError) {
           const e = itemsError as SupabaseErrorLike;
           console.error('[PRESCRIPTIONS] import-pdf Supabase error', { traceId, stepName: stepItemsInsert, code: e.code, message: e.message });
           await setPrescriptionError();
+          if (e.code === 'PGRST204' || String(e.message ?? '').includes('not found in schema cache')) {
+            const columnMatch = String(e.message ?? '').match(/'([^']+)'/);
+            const columnHint = columnMatch ? columnMatch[1] : 'unknown';
+            return res.status(500).json({
+              ok: false,
+              error: 'SCHEMA_CACHE_OUTDATED',
+              step: stepItemsInsert,
+              message: `Colonne manquante/${columnHint}. prescription_items doit avoir: prescription_id, user_id, profile_id, idx, label, raw_line, data (JSONB).`,
+              traceId,
+            });
+          }
           return res.status(500).json({
             ok: false,
             error: 'DB_INSERT_FAILED',
@@ -534,20 +529,45 @@ router.post(
             traceId,
           });
         }
-        itemsCount = rows.length;
       }
 
+      const stepPrescriptionsUpdate = 'prescriptions_update';
+      console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepPrescriptionsUpdate });
+      const prescriptionData = {
+        date_ordonnance: extracted.date_ordonnance ?? null,
+        medecin: extracted.medecin ?? null,
+        patient: extracted.patient ?? null,
+        items: extracted.items ?? [],
+      };
+      const { error: updateError } = await supabaseAdmin
+        .from('prescriptions')
+        .update({
+          status: PrescriptionStatus.READY,
+          raw_text: rawText,
+          data: prescriptionData,
+        })
+        .eq('id', prescriptionId);
+      if (updateError) {
+        const e = updateError as SupabaseErrorLike;
+        console.error('[PRESCRIPTIONS] import-pdf update prescription error', { traceId, code: e.code, message: e.message });
+        await setPrescriptionError();
+        return res.status(500).json({
+          ok: false,
+          error: 'DB_INSERT_FAILED',
+          step: stepPrescriptionsUpdate,
+          code: e.code ?? null,
+          message: e.message ?? null,
+          traceId,
+        });
+      }
+
+      const rawTextPreview = rawText.length > 300 ? rawText.slice(0, 300) + '…' : rawText;
       return res.status(200).json({
         ok: true,
         prescriptionId,
         status: PrescriptionStatus.READY,
-        extracted: {
-          date_ordonnance: extracted.date_ordonnance,
-          medecin: extracted.medecin,
-          patient: extracted.patient,
-          itemsCount,
-        },
-        itemsCount,
+        rawTextPreview,
+        data: prescriptionData,
       });
     } catch (err) {
       console.error('[PRESCRIPTIONS] import-pdf exception', { traceId, error: err });
@@ -660,27 +680,29 @@ router.get('/:id', requireUser, async (req: Request, res: Response) => {
 
     const { data: files } = await supabaseAdmin
       .from('prescription_files')
-      .select('bucket, storage_path, mime_type, size, original_name')
+      .select('storage_path, mime_type, size_bytes, original_name')
       .eq('prescription_id', id)
       .limit(1);
 
     const firstFile = Array.isArray(files) && files.length > 0 ? files[0] : null;
     const filePath = firstFile?.storage_path ?? (firstFile as { path?: string } | undefined)?.path;
+    const fileBucket = (firstFile as { bucket?: string } | undefined)?.bucket ?? BUCKET;
     let filePayload: { signedUrl: string; bucket: string; storage_path: string; mime_type: string | null; size: number | null; original_name: string | null } | null = null;
 
-    if (firstFile && firstFile.bucket && filePath) {
+    if (firstFile && filePath) {
       try {
         const signedUrl = await createSignedUrl({
-          bucket: firstFile.bucket,
+          bucket: fileBucket,
           path: filePath,
           expiresIn: SIGNED_URL_EXPIRES_IN,
         });
+        const sizeVal = (firstFile as { size?: number; size_bytes?: number }).size ?? (firstFile as { size_bytes?: number }).size_bytes ?? null;
         filePayload = {
           signedUrl,
-          bucket: firstFile.bucket,
+          bucket: fileBucket,
           storage_path: filePath,
           mime_type: firstFile.mime_type ?? null,
-          size: firstFile.size ?? null,
+          size: sizeVal,
           original_name: firstFile.original_name ?? null,
         };
       } catch (urlErr) {

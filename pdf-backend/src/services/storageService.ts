@@ -166,3 +166,22 @@ export function getPrescriptionFileStoragePath(
   const ext = safe.toLowerCase().endsWith('.pdf') ? '' : '.pdf';
   return `profiles/${profileId}/${prescriptionId}/${Date.now()}-${safe}${ext}`;
 }
+
+/**
+ * Chemin Storage DÉTERMINISTE pour import-pdf (pas dépendant de la réponse).
+ * Format: ${userId}/${profileId}/${prescriptionId}/${safeFilename}
+ * Toujours non vide.
+ */
+export function getPrescriptionStoragePathDeterministic(
+  userId: string,
+  profileId: string,
+  prescriptionId: string,
+  originalName: string
+): string {
+  let safe = originalName.trim() || 'document.pdf';
+  if (safe.toLowerCase().endsWith('.pdf.pdf')) safe = safe.slice(0, -4);
+  safe = safe.normalize('NFD').replace(/\p{Mark}/gu, '');
+  safe = safe.replace(/[\s/\\]+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_') || 'document';
+  if (!safe.toLowerCase().endsWith('.pdf')) safe += '.pdf';
+  return `${userId}/${profileId}/${prescriptionId}/${safe}`;
+}
