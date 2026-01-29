@@ -353,9 +353,10 @@ router.post(
     const stepPrescriptionsInsert = 'prescriptions_insert';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepPrescriptionsInsert });
 
-    // Toutes les clés possibles (date_ordonnance, medecin_*, patient_*, etc.)
+    // Toutes les clés possibles (user_id requis NOT NULL, owner_user_id, date_ordonnance, medecin_*, patient_*, etc.)
     const prescriptionRow: Record<string, unknown> = {
       id: prescriptionId,
+      user_id: userId,
       owner_user_id: userId,
       profile_id: profileId,
       status: prescriptionStatus,
@@ -375,7 +376,7 @@ router.post(
         insertPayload[k] = v;
       }
     }
-    console.log('[PRESCRIPTIONS] import-pdf insert prescriptions keys', { traceId, keys: Object.keys(insertPayload) });
+    console.log('[PRESCRIPTIONS] import-pdf insert prescriptions keys (no values)', { traceId, keys: Object.keys(insertPayload) });
 
     const { error: prescError } = await supabaseAdmin.from('prescriptions').insert(insertPayload);
 
