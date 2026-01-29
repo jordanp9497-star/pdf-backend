@@ -151,3 +151,18 @@ export function buildPrescriptionStoragePath(
   const safe = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
   return `${userId}/${profileId}/${prescriptionId}/${safe}`;
 }
+
+/**
+ * Path Storage pour prescription_files (NOT NULL).
+ * Format: profiles/<profileId>/<prescriptionId>/<timestamp>-<safeName>.pdf
+ * Toujours non vide.
+ */
+export function getPrescriptionFileStoragePath(
+  profileId: string,
+  prescriptionId: string,
+  originalName: string
+): string {
+  const safe = originalName.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.pdf\.pdf$/i, '.pdf') || 'document.pdf';
+  const ext = safe.toLowerCase().endsWith('.pdf') ? '' : '.pdf';
+  return `profiles/${profileId}/${prescriptionId}/${Date.now()}-${safe}${ext}`;
+}

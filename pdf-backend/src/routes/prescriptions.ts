@@ -3,7 +3,7 @@
  *
  * Tables Supabase:
  * - prescriptions (owner_user_id, profile_id, status, raw_text, date_ordonnance, medecin_*, patient_*)
- * - prescription_files (prescription_id, bucket, path, mime_type, size, original_name)
+ * - prescription_files (prescription_id, profile_id, user_id, owner_user_id, bucket, storage_path, original_name, mime_type, size)
  * - prescription_items (prescription_id + nom, dosage, forme, …)
  *
  * Monté sur /api/prescriptions
@@ -17,11 +17,10 @@ import { requireUser } from '../../middlewares/auth.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import {
   uploadBufferToStorage,
-  buildPrescriptionStoragePath,
   createSignedUrl,
   isBucketNotFoundError,
   normalizeOriginalFilename,
-  getUniqueStorageFilename,
+  getPrescriptionFileStoragePath,
 } from '../services/storageService.js';
 import { structurizePrescriptionText } from '../services/prescriptionStructService.js';
 import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
@@ -297,15 +296,16 @@ router.post(
     const contentType = req.file.mimetype || 'application/octet-stream';
     const size = buffer.length;
     const originalNameForDb = normalizeOriginalFilename(req.file.originalname || 'document.pdf');
-    const storageFilename = getUniqueStorageFilename();
     const prescriptionId = randomUUID();
-
-    const storagePath = buildPrescriptionStoragePath(
-      userId,
-      profileId,
-      prescriptionId,
-      storageFilename
-    );
+    const storagePath = getPrescriptionFileStoragePath(profileId, prescriptionId, originalNameForDb);
+    if (!storagePath || !storagePath.trim()) {
+      return res.status(500).json({
+        ok: false,
+        error: 'INTERNAL_ERROR',
+        message: 'storage_path vide',
+        traceId,
+      });
+    }
     const stepStorageUpload = 'storage_upload';
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepStorageUpload });
 
@@ -397,11 +397,14 @@ router.post(
     console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepFilesInsert });
     const { error: fileError } = await supabaseAdmin.from('prescription_files').insert({
       prescription_id: prescriptionId,
+      profile_id: profileId,
+      user_id: userId,
+      owner_user_id: userId,
       bucket: BUCKET,
-      path: storagePath,
+      storage_path: storagePath,
+      original_name: originalNameForDb,
       mime_type: contentType,
       size,
-      original_name: originalNameForDb,
     });
     if (fileError) {
       const e = fileError as SupabaseErrorLike;
@@ -657,24 +660,25 @@ router.get('/:id', requireUser, async (req: Request, res: Response) => {
 
     const { data: files } = await supabaseAdmin
       .from('prescription_files')
-      .select('bucket, path, mime_type, size, original_name')
+      .select('bucket, storage_path, mime_type, size, original_name')
       .eq('prescription_id', id)
       .limit(1);
 
     const firstFile = Array.isArray(files) && files.length > 0 ? files[0] : null;
-    let filePayload: { signedUrl: string; bucket: string; path: string; mime_type: string | null; size: number | null; original_name: string | null } | null = null;
+    const filePath = firstFile?.storage_path ?? (firstFile as { path?: string } | undefined)?.path;
+    let filePayload: { signedUrl: string; bucket: string; storage_path: string; mime_type: string | null; size: number | null; original_name: string | null } | null = null;
 
-    if (firstFile && firstFile.bucket && firstFile.path) {
+    if (firstFile && firstFile.bucket && filePath) {
       try {
         const signedUrl = await createSignedUrl({
           bucket: firstFile.bucket,
-          path: firstFile.path,
+          path: filePath,
           expiresIn: SIGNED_URL_EXPIRES_IN,
         });
         filePayload = {
           signedUrl,
           bucket: firstFile.bucket,
-          path: firstFile.path,
+          storage_path: filePath,
           mime_type: firstFile.mime_type ?? null,
           size: firstFile.size ?? null,
           original_name: firstFile.original_name ?? null,
