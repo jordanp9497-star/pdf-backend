@@ -502,11 +502,11 @@ router.post(
 );
 
 /**
- * POST /api/prescriptions/import-pdf (2 phases, réponse < 1–2s)
+ * POST /api/prescriptions/import-pdf (mode manuel)
  *
- * Phase 1 (synchrone): token → userId, profile_id, file présent (req.file.path). Insert prescriptions (status=processing). Réponse immédiate: { ok, prescriptionId, status: 'processing', traceId }.
- *
- * Phase 2 (async, après res.json, sans await): upload Storage, insert prescription_files (storage_path non-null), extract rawText (pdf-parse), si vide → manual_required, sinon parse IA → items + ready. Cleanup: fs.unlink(tmp). Erreur => status='error' + data={error, step}. Logs: [IMPORT_PDF][traceId][step].
+ * Crée prescription (status=manual_required, needs_review=true, document_kind=medicament, doc_context=general),
+ * enregistre le fichier dans Storage + prescription_files. Pas d'OCR/parsing.
+ * Réponse: { ok, prescription_id, file_id, mime_type, storage_path }.
  */
 router.post(
   '/import-pdf',
@@ -581,7 +581,6 @@ router.post(
 
     const originalNameForDb = normalizeOriginalFilename(originalName);
     const prescriptionId = randomUUID();
-    // storagePath calculé AVANT upload (upload fait en async dans processPrescriptionPdf).
     const storagePath = getPrescriptionStoragePathDeterministic(userId, profileId, prescriptionId, originalNameForDb);
     if (!storagePath || !storagePath.trim()) {
       return res.status(500).json({
@@ -592,19 +591,18 @@ router.post(
       });
     }
 
-    // IMPORTANT: ne jamais lire tout le fichier en Buffer avant d'avoir renvoyé l'ACK JSON.
-    // L'upload Storage + extraction PDF se font dans processPrescriptionPdf (après ACK).
-
     type SupabaseErrorLike = { code?: string; message?: string; details?: string; hint?: string };
     console.log(`${LOG_PREFIX}[${traceId}][prescriptions_insert]`);
 
-    // Toujours 'processing' à la création (jamais 'draft' pendant l'import).
     const insertPayload: Record<string, unknown> = {
       id: prescriptionId,
       user_id: userId,
       owner_user_id: userId,
       profile_id: profileId,
-      status: PrescriptionStatus.PROCESSING,
+      status: PrescriptionStatus.MANUAL_REQUIRED,
+      needs_review: true,
+      document_kind: 'medicament',
+      doc_context: 'general',
       raw_text: null,
       data: {},
     };
@@ -635,24 +633,84 @@ router.post(
       });
     }
 
-    // Phase 1 terminée : répondre immédiatement (< 1–2s). Phase 2 (upload, prescription_files, extract, IA) en async.
-    res.status(200).json({
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(tmpPath);
+    } catch (readErr) {
+      console.error(`${LOG_PREFIX}[${traceId}][read_tmp]`, readErr);
+      return res.status(500).json({
+        ok: false,
+        error: 'INTERNAL_ERROR',
+        message: 'Impossible de lire le fichier temporaire',
+        traceId,
+      });
+    }
+
+    try {
+      await uploadBufferToStorage({
+        bucket: BUCKET,
+        path: storagePath,
+        buffer,
+        contentType: mimeType,
+      });
+    } catch (uploadErr) {
+      console.error(`${LOG_PREFIX}[${traceId}][storage_upload]`, uploadErr);
+      if (isBucketNotFoundError(uploadErr)) {
+        return res.status(500).json({
+          ok: false,
+          error: 'BUCKET_NOT_FOUND',
+          message: 'Bucket Storage "prescriptions" introuvable',
+          traceId,
+        });
+      }
+      return res.status(500).json({
+        ok: false,
+        error: 'STORAGE_UPLOAD_FAILED',
+        message: uploadErr instanceof Error ? uploadErr.message : 'Upload échoué',
+        traceId,
+      });
+    }
+
+    const { data: fileRow, error: fileErr } = await supabaseAdmin
+      .from('prescription_files')
+      .insert({
+        prescription_id: prescriptionId,
+        user_id: userId,
+        profile_id: profileId,
+        storage_path: storagePath,
+        original_name: originalName ?? originalNameForDb,
+        mime_type: mimeType,
+        size_bytes: sizeBytes,
+        meta: { source: 'pdf' },
+      })
+      .select('id')
+      .single();
+
+    try {
+      await fs.unlink(tmpPath);
+    } catch (_) {
+      // ignore
+    }
+
+    if (fileErr || !fileRow) {
+      console.error(`${LOG_PREFIX}[${traceId}][prescription_files_insert]`, fileErr);
+      return res.status(500).json({
+        ok: false,
+        error: 'DB_INSERT_FAILED',
+        step: 'prescription_files_insert',
+        message: fileErr?.message ?? null,
+        traceId,
+      });
+    }
+
+    return res.status(200).json({
       ok: true,
-      prescriptionId,
-      status: PrescriptionStatus.PROCESSING,
+      prescription_id: prescriptionId,
+      file_id: fileRow.id,
+      mime_type: mimeType,
+      storage_path: storagePath,
       traceId,
     });
-    processPrescriptionPdf({
-      prescriptionId,
-      userId,
-      profileId,
-      storagePath,
-      tmpPath,
-      contentType: mimeType,
-      originalName: originalName ?? originalNameForDb,
-      sizeBytes,
-      traceId,
-    }).catch((err) => console.error(`${LOG_PREFIX}[${traceId}][processPrescriptionPdf]`, err));
     } catch (err) {
       console.error(`${LOG_PREFIX}[${traceId}][sync_error]`, err);
       if (!res.headersSent) {
@@ -903,10 +961,12 @@ function processPrescriptionPhoto(params: {
 }
 
 /**
- * POST /api/prescriptions/import-photo
+ * POST /api/prescriptions/import-photo (mode manuel)
  *
- * Multipart: profile_id (string), file (image/jpeg). Auth Bearer obligatoire.
- * Réponse immédiate { ok: true, prescriptionId, status: 'processing' }. OCR+parse en background (setImmediate).
+ * Multipart: profile_id (string), file (image/jpeg ou image/png). Auth Bearer obligatoire.
+ * Crée prescription (status=manual_required, needs_review=true, document_kind=medicament, doc_context=general),
+ * enregistre le fichier dans Storage + prescription_files. Pas d'OCR/parsing.
+ * Réponse: { ok, prescription_id, file_id, mime_type, storage_path }.
  */
 router.post(
   '/import-photo',
@@ -990,7 +1050,12 @@ router.post(
         user_id: userId,
         owner_user_id: userId,
         profile_id: profileId,
-        status: PrescriptionStatus.PROCESSING,
+        status: PrescriptionStatus.MANUAL_REQUIRED,
+        needs_review: true,
+        document_kind: 'medicament',
+        doc_context: 'general',
+        raw_text: null,
+        data: {},
       };
       const { error: prescError } = await supabaseAdmin.from('prescriptions').insert(insertPayload);
       if (prescError) {
@@ -1005,40 +1070,40 @@ router.post(
       }
 
       console.log(`${LOG_PREFIX_PHOTO}[${traceId}][prescription_files_insert]`);
-      const filesPayload: Record<string, unknown> = {
-        prescription_id: prescriptionId,
-        profile_id: profileId,
-        user_id: userId,
-        storage_path: storagePath,
-        mime_type: mimetype,
-        size_bytes: size,
-        original_name: originalname,
-        meta: { kind: 'photo', source: 'photo' },
-      };
-      const { error: fileError } = await supabaseAdmin.from('prescription_files').insert(filesPayload);
-      if (fileError) {
+      const { data: fileRow, error: fileError } = await supabaseAdmin
+        .from('prescription_files')
+        .insert({
+          prescription_id: prescriptionId,
+          profile_id: profileId,
+          user_id: userId,
+          storage_path: storagePath,
+          mime_type: mimetype,
+          size_bytes: size,
+          original_name: originalname,
+          meta: { kind: 'photo', source: 'photo' },
+        })
+        .select('id')
+        .single();
+
+      if (fileError || !fileRow) {
         console.error(`${LOG_PREFIX_PHOTO}[${traceId}][prescription_files_insert]`, fileError);
         await supabaseAdmin.from('prescriptions').update({ status: PrescriptionStatus.ERROR }).eq('id', prescriptionId);
         return res.status(500).json({
           ok: false,
           error: 'DB_INSERT_FAILED',
           step: 'prescription_files_insert',
-          message: fileError.message ?? null,
+          message: fileError?.message ?? null,
           traceId,
         });
       }
 
-      res.status(200).json({ ok: true, prescriptionId, status: PrescriptionStatus.PROCESSING, traceId });
-
-      setImmediate(() => {
-        processPrescriptionPhoto({
-          prescriptionId,
-          userId,
-          profileId,
-          buffer,
-          mimeType: mimetype,
-          traceId,
-        });
+      return res.status(200).json({
+        ok: true,
+        prescription_id: prescriptionId,
+        file_id: fileRow.id,
+        mime_type: mimetype,
+        storage_path: storagePath,
+        traceId,
       });
     } catch (err) {
       console.error(`${LOG_PREFIX_PHOTO}[${traceId}][sync_error]`, err);

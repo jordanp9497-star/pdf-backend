@@ -201,6 +201,11 @@ import childrenRouter from './routes/children.routes.js';
 app.use('/api/children', childrenRouter);
 console.log('[CHILDREN] routes mounted (GET/POST /api/children, GET/PATCH/DELETE /api/children/:id)');
 
+// ===== ROUTES APPOINTMENTS (RDV liés à une prescription) =====
+import appointmentsRouter from './routes/appointments.routes.js';
+app.use('/api/appointments', appointmentsRouter);
+console.log('[APPOINTMENTS] routes mounted (POST /api/appointments)');
+
 // ===== ROUTES DEVICES =====
 import devicesRouter from './routes/devices.routes.js';
 app.use('/devices', devicesRouter);
