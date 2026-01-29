@@ -194,7 +194,7 @@ console.log('[ORDONNANCES] routes mounted (POST /ordonnances/:id/recovered)');
 // ===== ROUTES PRESCRIPTIONS (import ordonnance PDF) =====
 import prescriptionsRouter from './src/routes/prescriptions.js';
 app.use('/api/prescriptions', prescriptionsRouter);
-console.log('[PRESCRIPTIONS] routes mounted (GET /api/prescriptions, GET /api/prescriptions/:id, PATCH /api/prescriptions/:id, POST /api/prescriptions/import, POST /api/prescriptions/import-pdf, POST /api/prescriptions/import-pdf/debug)');
+console.log('[PRESCRIPTIONS] routes mounted (GET /api/prescriptions, GET /api/prescriptions/:id, GET /api/prescriptions/:id/preview, PATCH /api/prescriptions/:id, POST /api/prescriptions/import, POST /api/prescriptions/import-pdf, POST /api/prescriptions/import-pdf/debug)');
 
 // ===== ROUTES CHILDREN (CRUD enfants, owner_user_id = auth user) =====
 import childrenRouter from './routes/children.routes.js';

@@ -66,9 +66,10 @@ export async function uploadBufferToStorage(
   options: UploadBufferOptions
 ): Promise<{ path: string }> {
   const { bucket, path, buffer, contentType } = options;
+  const contentTypeHeader = contentType && contentType.trim() ? contentType.trim() : 'application/octet-stream';
 
   const { data, error } = await supabaseAdmin.storage.from(bucket).upload(path, buffer, {
-    contentType,
+    contentType: contentTypeHeader,
     upsert: false,
   });
 

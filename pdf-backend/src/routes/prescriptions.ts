@@ -1173,6 +1173,121 @@ router.get('/', requireUser, async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/prescriptions/:id/preview
+ *
+ * Auth requireUser. Vérifie owner_user_id/user_id. Dernier fichier (prescription_files order by created_at desc limit 1).
+ * bucket = row.storage_bucket ?? row.bucket ?? 'prescriptions', path = row.storage_path ?? row.path.
+ * Signed URL 3600s. Réponse: { ok: true, file: { ... }, url } (snake_case + camelCase).
+ */
+router.get('/:id/preview', requireUser, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as Request & { userId?: string }).userId;
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: 'Authentification requise',
+      });
+    }
+
+    const id = req.params.id?.trim();
+    if (!id) {
+      return res.status(400).json({
+        ok: false,
+        error: 'BAD_REQUEST',
+        message: 'ID de prescription requis',
+      });
+    }
+
+    const { data: prescription, error: prescError } = await supabaseAdmin
+      .from('prescriptions')
+      .select('id')
+      .eq('id', id)
+      .or(`owner_user_id.eq.${userId},user_id.eq.${userId}`)
+      .maybeSingle();
+
+    if (prescError) {
+      console.error('[PRESCRIPTIONS] preview load prescription:', prescError);
+      return res.status(500).json({
+        ok: false,
+        error: 'DATABASE_ERROR',
+        message: 'Erreur lors de la récupération de la prescription',
+      });
+    }
+
+    if (!prescription) {
+      return res.status(404).json({
+        ok: false,
+        error: 'NOT_FOUND',
+        message: 'Prescription introuvable',
+      });
+    }
+
+    const { data: fileRow, error: fileError } = await supabaseAdmin
+      .from('prescription_files')
+      .select('*')
+      .eq('prescription_id', id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (fileError) {
+      console.error('[PRESCRIPTIONS] preview load file:', fileError);
+      return res.status(500).json({
+        ok: false,
+        error: 'DATABASE_ERROR',
+        message: 'Erreur lors de la récupération du fichier',
+      });
+    }
+
+    type FileRow = { storage_path?: string | null; storage_bucket?: string | null; path?: string | null; bucket?: string | null; mime_type?: string | null; id?: string };
+    const row = fileRow as FileRow | null;
+    const storagePath = (row?.storage_path ?? row?.path ?? '').toString().trim();
+    const storageBucket = (row?.storage_bucket ?? row?.bucket ?? BUCKET).toString().trim() || BUCKET;
+
+    if (!storagePath) {
+      return res.status(404).json({
+        ok: false,
+        error: 'FILE_NOT_FOUND',
+        message: 'Aucun fichier associé à cette prescription',
+      });
+    }
+
+    const url = await createSignedUrl({
+      bucket: storageBucket,
+      path: storagePath,
+      expiresIn: 3600,
+    });
+
+    const mimeType = row?.mime_type ?? null;
+    const fileId = row?.id ?? null;
+
+    return res.status(200).json({
+      ok: true,
+      url,
+      file: {
+        file_id: fileId,
+        mime_type: mimeType,
+        storage_path: storagePath,
+        storage_bucket: storageBucket,
+        url,
+        fileId: fileId,
+        mimeType: mimeType,
+        storagePath: storagePath,
+        storageBucket: storageBucket,
+      },
+    });
+  } catch (err) {
+    console.error('[PRESCRIPTIONS] preview error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'INTERNAL_ERROR',
+      message: err instanceof Error ? err.message : 'Erreur serveur',
+    });
+  }
+});
+
+/**
  * GET /api/prescriptions/:id
  *
  * Auth requireUser. Charge prescription (doit appartenir à req.userId),
