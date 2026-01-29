@@ -1,6 +1,7 @@
 /**
  * Routes pour la gestion des abonnements Stripe
  *
+ * GET /billing/plans - Liste des plans visibles (premium_monthly 4,99€, premium_annual 49,99€)
  * GET /billing/me - Entitlements / premium (plan, pregnancy_pack_enabled)
  * POST /billing/create-checkout-session - Créer une session de checkout Stripe
  * POST /billing/webhook - Webhook Stripe pour mettre à jour les abonnements
@@ -19,8 +20,62 @@ const router = express.Router();
 // Utiliser les clients centralisés
 const supabase = supabaseAdmin;
 
+// Plans visibles dans le menu abonnements (exclut l'ancien plan 2,99€)
+const VISIBLE_PLAN_IDS = ['premium_monthly', 'premium_annual'];
+
 // Price ID Premium hardcodé (sécurité: jamais accepté depuis le client)
 const PREMIUM_PRICE_ID = 'price_1SsTI3L9JokDSsqLuZralNuv';
+
+/**
+ * GET /billing/plans
+ *
+ * Retourne les 2 plans visibles: premium_monthly (4,99€), premium_annual (49,99€).
+ * Champs exposés: id, display_name, monthly_price_cents, annual_price_cents, highlight, features.
+ * Tri: highlight desc, puis prix (monthly_price_cents).
+ */
+router.get('/plans', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error: 'CONFIG_ERROR',
+        message: 'Configuration Supabase manquante',
+      });
+    }
+    const { data: plans, error } = await supabase
+      .from('subscription_plans')
+      .select('id, display_name, monthly_price_cents, annual_price_cents, highlight, features')
+      .in('id', VISIBLE_PLAN_IDS)
+      .order('highlight', { ascending: false })
+      .order('monthly_price_cents', { ascending: true });
+
+    if (error) {
+      console.error('[BILLING] GET /plans error:', error);
+      return res.status(500).json({
+        ok: false,
+        error: 'DATABASE_ERROR',
+        message: error.message ?? 'Erreur lors de la récupération des plans',
+      });
+    }
+
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+    });
+    res.status(200).json({
+      ok: true,
+      plans: plans ?? [],
+    });
+  } catch (err) {
+    console.error('[BILLING] GET /plans error:', err);
+    res.status(500).json({
+      ok: false,
+      error: 'INTERNAL_ERROR',
+      message: 'Erreur serveur',
+    });
+  }
+});
 
 /**
  * Helper: Vérifie si un utilisateur est abonné (actif)

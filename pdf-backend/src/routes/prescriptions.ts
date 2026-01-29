@@ -710,6 +710,10 @@ router.post(
       mime_type: mimeType,
       storage_path: storagePath,
       traceId,
+      prescriptionId,
+      fileId: fileRow.id,
+      mimeType: mimeType,
+      storagePath: storagePath,
     });
     } catch (err) {
       console.error(`${LOG_PREFIX}[${traceId}][sync_error]`, err);
@@ -1104,6 +1108,10 @@ router.post(
         mime_type: mimetype,
         storage_path: storagePath,
         traceId,
+        prescriptionId,
+        fileId: fileRow.id,
+        mimeType: mimetype,
+        storagePath: storagePath,
       });
     } catch (err) {
       console.error(`${LOG_PREFIX_PHOTO}[${traceId}][sync_error]`, err);
