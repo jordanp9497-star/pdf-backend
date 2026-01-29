@@ -223,6 +223,42 @@ router.post(
       });
     }
 
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .select('id, owner_user_id')
+      .eq('id', profileId)
+      .maybeSingle();
+
+    if (profileError) {
+      console.error('[PRESCRIPTIONS] import-pdf profile fetch', { traceId, profileId, error: profileError });
+      return res.status(500).json({
+        ok: false,
+        error: 'DB_ERROR',
+        message: profileError.message ?? 'Erreur lors de la vérification du profil',
+        traceId,
+      });
+    }
+
+    if (!profile) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROFILE_NOT_FOUND',
+        message: 'Profil introuvable',
+        profileId,
+        traceId,
+      });
+    }
+
+    if (profile.owner_user_id !== userId) {
+      return res.status(403).json({
+        ok: false,
+        error: 'PROFILE_FORBIDDEN',
+        message: 'Vous n\'avez pas accès à ce profil',
+        profileId,
+        traceId,
+      });
+    }
+
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({
         ok: false,
@@ -251,7 +287,8 @@ router.post(
       prescriptionId,
       storageFilename
     );
-    console.log('[PRESCRIPTIONS] import-pdf storage upload', { traceId, bucket: BUCKET, path: storagePath });
+    const stepStorageUpload = 'storage_upload';
+    console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepStorageUpload });
 
     try {
       await uploadBufferToStorage({
@@ -262,13 +299,14 @@ router.post(
       });
     } catch (storageErr: unknown) {
       const err = storageErr as Error & { message?: string; code?: string; statusCode?: number };
-      console.error('[PRESCRIPTIONS] import-pdf storage upload failed', { traceId, error: err });
+      console.error('[PRESCRIPTIONS] import-pdf storage upload failed', { traceId, stepName: stepStorageUpload, error: err });
       if (isBucketNotFoundError(storageErr)) {
         return res.status(500).json({
           ok: false,
           error: 'BUCKET_NOT_FOUND',
           message: 'Le bucket Storage "prescriptions" est introuvable. Créez-le dans le dashboard Supabase ou vérifiez la config.',
           details: err?.message ?? null,
+          traceId,
         });
       }
       const details =
@@ -278,8 +316,10 @@ router.post(
       return res.status(500).json({
         ok: false,
         error: 'STORAGE_UPLOAD_FAILED',
+        step: stepStorageUpload,
         message: err?.message ?? 'Upload Storage échoué',
         details,
+        traceId,
       });
     }
 
@@ -318,7 +358,11 @@ router.post(
     const medecin = extracted.medecin;
     const patient = extracted.patient;
 
-    const { error: prescError } = await supabaseAdmin.from('prescriptions').insert({
+    type SupabaseErrorLike = { code?: string; message?: string; details?: string; hint?: string };
+    const stepPrescriptionsInsert = 'prescriptions_insert';
+    console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepPrescriptionsInsert });
+
+    const prescriptionRow: Record<string, unknown> = {
       id: prescriptionId,
       owner_user_id: userId,
       profile_id: profileId,
@@ -331,16 +375,51 @@ router.post(
       patient_nom: patient?.nom ?? null,
       patient_prenom: patient?.prenom ?? null,
       patient_date_naissance: patient?.date_naissance ?? null,
-    });
+    };
+    const insertPayload: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(prescriptionRow)) {
+      if (v !== undefined && v !== null) {
+        insertPayload[k] = v;
+      }
+    }
+    console.log('[PRESCRIPTIONS] import-pdf insert prescriptions keys', { traceId, keys: Object.keys(insertPayload) });
+
+    const { error: prescError } = await supabaseAdmin.from('prescriptions').insert(insertPayload);
 
     if (prescError) {
-      console.error('[PRESCRIPTIONS] import-pdf insert prescription:', prescError);
+      const e = prescError as SupabaseErrorLike;
+      console.error('[PRESCRIPTIONS] import-pdf Supabase error', {
+        traceId,
+        stepName: stepPrescriptionsInsert,
+        code: e.code,
+        message: e.message,
+        details: e.details,
+        hint: e.hint,
+      });
+      if (e.code === 'PGRST204' || String(e.message ?? '').includes('not found in schema cache')) {
+        const columnMatch = String(e.message ?? '').match(/'([^']+)'/);
+        const columnHint = columnMatch ? columnMatch[1] : 'date_ordonnance';
+        return res.status(500).json({
+          ok: false,
+          error: 'SCHEMA_CACHE_OUTDATED',
+          message: `Colonne manquante/${columnHint}`,
+          traceId,
+        });
+      }
       return res.status(500).json({
         ok: false,
-        error: 'DATABASE_ERROR',
-        message: 'Erreur lors de la création de la prescription',
+        error: 'DB_INSERT_FAILED',
+        step: stepPrescriptionsInsert,
+        code: e.code ?? null,
+        message: e.message ?? 'Erreur insert prescriptions',
+        details: e.details ?? null,
+        hint: e.hint ?? null,
+        traceId,
       });
     }
+
+    const stepFilesInsert = 'prescription_files_insert';
+    console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepFilesInsert });
 
     const { error: fileError } = await supabaseAdmin.from('prescription_files').insert({
       prescription_id: prescriptionId,
@@ -352,12 +431,32 @@ router.post(
     });
 
     if (fileError) {
-      console.error('[PRESCRIPTIONS] import-pdf insert prescription_files:', fileError);
+      const e = fileError as SupabaseErrorLike;
+      console.error('[PRESCRIPTIONS] import-pdf Supabase error', {
+        traceId,
+        stepName: stepFilesInsert,
+        code: e.code,
+        message: e.message,
+        details: e.details,
+        hint: e.hint,
+      });
+      return res.status(500).json({
+        ok: false,
+        error: 'DB_INSERT_FAILED',
+        step: stepFilesInsert,
+        code: e.code ?? null,
+        message: e.message ?? 'Erreur insert prescription_files',
+        details: e.details ?? null,
+        hint: e.hint ?? null,
+        traceId,
+      });
     }
 
     const items = Array.isArray(extracted.items) ? extracted.items : [];
     let itemsCount = 0;
+    const stepItemsInsert = 'prescription_items_insert';
     if (items.length > 0) {
+      console.log('[PRESCRIPTIONS] import-pdf step', { traceId, stepName: stepItemsInsert });
       const rows = items.slice(0, 500).map((item) => ({
         prescription_id: prescriptionId,
         nom: item.nom ?? null,
@@ -369,8 +468,28 @@ router.post(
         instructions: item.instructions ?? null,
       }));
       const { error: itemsError } = await supabaseAdmin.from('prescription_items').insert(rows);
-      if (!itemsError) itemsCount = rows.length;
-      else console.error('[PRESCRIPTIONS] import-pdf insert prescription_items:', itemsError);
+      if (itemsError) {
+        const e = itemsError as SupabaseErrorLike;
+        console.error('[PRESCRIPTIONS] import-pdf Supabase error', {
+          traceId,
+          stepName: stepItemsInsert,
+          code: e.code,
+          message: e.message,
+          details: e.details,
+          hint: e.hint,
+        });
+        return res.status(500).json({
+          ok: false,
+          error: 'DB_INSERT_FAILED',
+          step: stepItemsInsert,
+          code: e.code ?? null,
+          message: e.message ?? 'Erreur insert prescription_items',
+          details: e.details ?? null,
+          hint: e.hint ?? null,
+          traceId,
+        });
+      }
+      itemsCount = rows.length;
     }
 
     if (prescriptionStatus === 'needs_manual') {

@@ -6,10 +6,10 @@ import { logEnvStatus } from './src/config/env.js';
 console.log("✅ BOOT SIGNATURE __BUILD_CHECK");
 console.log("🚀 Backend started");
 
-// Crash au démarrage si Supabase manquant (Storage / auth)
+// Crash au démarrage si Supabase manquant (Storage / auth / import-pdf)
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error(
-    'Démarrage impossible: SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis. Définissez-les dans vos variables d\'environnement.'
+    'Démarrage impossible: SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis (supabaseAdmin = service-role, pas anon). Définissez-les dans vos variables d\'environnement.'
   );
 }
 
