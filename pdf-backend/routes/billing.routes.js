@@ -58,6 +58,9 @@ router.get('/plans', async (req, res) => {
       });
     }
 
+    // Ne renvoyer que premium_monthly et premium_annual (exclut ancien 2,99€ ou autre "premium")
+    const filtered = (plans ?? []).filter((p) => p && VISIBLE_PLAN_IDS.includes(p.id));
+
     res.set({
       'Cache-Control': 'no-store, no-cache, must-revalidate',
       Pragma: 'no-cache',
@@ -65,7 +68,7 @@ router.get('/plans', async (req, res) => {
     });
     res.status(200).json({
       ok: true,
-      plans: plans ?? [],
+      plans: filtered,
     });
   } catch (err) {
     console.error('[BILLING] GET /plans error:', err);
