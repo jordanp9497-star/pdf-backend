@@ -28,14 +28,33 @@ import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
 
 const router = express.Router();
 
-/** Statuts autorisés par la contrainte prescriptions_status_check (Supabase). */
+/**
+ * Statuts stricts pour prescriptions (contrainte DB prescriptions_status_check).
+ * Seules valeurs autorisées: processing | ready | manual_required | error.
+ *
+ * Import-pdf:
+ * - Création prescription => status = "processing"
+ * - Pas de texte exploitable => update status = "manual_required"
+ * - Parsing OK => update status = "ready"
+ * - Exception => update status = "error"
+ *
+ * Aucune autre valeur n'est autorisée.
+ */
 export const PrescriptionStatus = {
   PROCESSING: 'processing',
   READY: 'ready',
   MANUAL_REQUIRED: 'manual_required',
   ERROR: 'error',
 } as const;
+
 export type PrescriptionStatusType = (typeof PrescriptionStatus)[keyof typeof PrescriptionStatus];
+
+const PRESCRIPTION_STATUS_VALUES: readonly PrescriptionStatusType[] = Object.values(PrescriptionStatus);
+
+/** Vérifie que la valeur est un statut autorisé ; interdit toute autre valeur. */
+export function isPrescriptionStatus(value: unknown): value is PrescriptionStatusType {
+  return typeof value === 'string' && PRESCRIPTION_STATUS_VALUES.includes(value as PrescriptionStatusType);
+}
 
 const BUCKET = 'prescriptions';
 const UPLOAD_LIMIT = 10 * 1024 * 1024; // 10MB
@@ -763,12 +782,11 @@ router.patch('/:id', requireUser, async (req: Request, res: Response) => {
 
     const updatePresc: Record<string, unknown> = {};
     if (body.status !== undefined) {
-      const allowed = Object.values(PrescriptionStatus) as string[];
-      if (!allowed.includes(body.status)) {
+      if (!isPrescriptionStatus(body.status)) {
         return res.status(400).json({
           ok: false,
           error: 'BAD_REQUEST',
-          message: `status doit être l'un de: ${allowed.join(', ')}`,
+          message: `status doit être l'un de: ${PRESCRIPTION_STATUS_VALUES.join(', ')}`,
         });
       }
       updatePresc.status = body.status;
