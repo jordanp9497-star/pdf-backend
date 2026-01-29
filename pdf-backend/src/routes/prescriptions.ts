@@ -9,8 +9,10 @@
  * Monté sur /api/prescriptions
  */
 
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
+import os from 'os';
+import fs from 'fs/promises';
 import pdfParse from 'pdf-parse';
 import { randomUUID } from 'crypto';
 import { requireUser } from '../../middlewares/auth.js';
@@ -67,57 +69,155 @@ const uploadPdf = multer({
   },
 });
 
-/** Multer pour import-pdf : champ "file", 10MB */
+/** Nom de fichier safe pour tmp (diskStorage). */
+function safeTmpFilename(): string {
+  const ext = '.pdf';
+  const safe = `${Date.now()}-${randomUUID().replace(/-/g, '').slice(0, 12)}${ext}`;
+  return safe;
+}
+
+/** Multer pour import-pdf : diskStorage (os.tmpdir()), champ "file", 10MB. Ne jamais lire tout le fichier en Buffer avant ACK. */
 const uploadImportPdf = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, _file, cb) => cb(null, safeTmpFilename()),
+  }),
   limits: { fileSize: UPLOAD_LIMIT },
 });
 
+export type TmpFileInfo = {
+  tmpPath: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+};
+
+/**
+ * Helper: infos du fichier tmp (multer diskStorage).
+ * Retourne null si req.file absent.
+ */
+export function getTmpFileInfo(file: Express.Multer.File | undefined): TmpFileInfo | null {
+  if (!file || !file.path) return null;
+  const tmpPath = typeof file.path === 'string' ? file.path : (file as { path?: string }).path ?? '';
+  if (!tmpPath) return null;
+  return {
+    tmpPath,
+    originalName: file.originalname ?? 'document.pdf',
+    mimeType: file.mimetype ?? 'application/octet-stream',
+    sizeBytes: file.size ?? 0,
+  };
+}
+
 const LOG_PREFIX = '[IMPORT_PDF]';
 const OPENAI_TIMEOUT_MS = 15000;
+
+/** Middleware: log start/end + durée + traceId pour import-pdf (isolant 502). */
+function importPdfLogMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const traceId = randomUUID();
+  (req as Request & { importPdfTraceId?: string }).importPdfTraceId = traceId;
+  const start = Date.now();
+  console.log(`${LOG_PREFIX}[${traceId}][middleware_start]`);
+  res.on('finish', () => {
+    const durationMs = Date.now() - start;
+    console.log(`${LOG_PREFIX}[${traceId}][middleware_end] duration_ms=${durationMs}`);
+  });
+  next();
+}
 
 type ProcessPrescriptionPdfParams = {
   prescriptionId: string;
   userId: string;
   profileId: string;
   storagePath: string;
-  buffer: Buffer;
+  tmpPath: string;
+  contentType: string;
+  originalName: string;
+  sizeBytes: number;
   traceId: string;
 };
 
 /**
- * Traitement async post-upload : extraction PDF, OpenAI, update prescription, insert items.
- * Retourne une Promise pour que l'appelant puisse .catch() (ne jamais laisser une promise non catch).
+ * Phase 2 (async) : upload Storage, insert prescription_files, extraction PDF, OpenAI, update prescription, insert items.
+ * Tous les steps en try/catch avec [IMPORT_PDF][traceId][step]. Si erreur => status='error' + data={error, step}.
  */
 function processPrescriptionPdf(params: ProcessPrescriptionPdfParams): Promise<void> {
-  const { prescriptionId, userId, profileId, buffer, traceId } = params;
-  const step = (name: string) => `${LOG_PREFIX}[${traceId}][${name}]`;
+  const { prescriptionId, userId, profileId, storagePath, tmpPath, contentType, originalName, sizeBytes, traceId } = params;
+  const stepName = (name: string) => `${LOG_PREFIX}[${traceId}][${name}]`;
 
-  const setError = async () => {
+  const setError = async (step: string, err?: unknown) => {
     try {
+      const msg = err instanceof Error ? err.message : String(err ?? step);
+      console.error(stepName(step), err ?? step);
       await supabaseAdmin
         .from('prescriptions')
-        .update({ status: PrescriptionStatus.ERROR })
+        .update({ status: PrescriptionStatus.ERROR, data: { error: msg, step } })
         .eq('id', prescriptionId);
     } catch (e) {
-      console.error(step('setError'), e);
+      console.error(stepName('setError'), e);
     }
   };
 
   return (async () => {
+    let buffer: Buffer | null = null;
     try {
+      // --- read_tmp ---
+      try {
+        console.log(stepName('read_tmp'), tmpPath);
+        buffer = await fs.readFile(tmpPath);
+      } catch (e) {
+        await setError('read_tmp', e);
+        return;
+      }
+
+      // --- storage_upload ---
+      try {
+        console.log(stepName('storage_upload'));
+        await uploadBufferToStorage({
+          bucket: BUCKET,
+          path: storagePath,
+          buffer: buffer!,
+          contentType,
+        });
+      } catch (e) {
+        await setError('storage_upload', e);
+        return;
+      }
+
+      // --- prescription_files_insert (storage_path non-null après upload) ---
+      try {
+        console.log(stepName('prescription_files_insert'));
+        const { error: fileErr } = await supabaseAdmin.from('prescription_files').insert({
+          prescription_id: prescriptionId,
+          user_id: userId,
+          profile_id: profileId,
+          storage_path: storagePath,
+          original_name: originalName,
+          mime_type: contentType,
+          size_bytes: sizeBytes,
+          meta: { source: 'pdf' },
+        });
+        if (fileErr) {
+          await setError('prescription_files_insert', fileErr);
+          return;
+        }
+      } catch (e) {
+        await setError('prescription_files_insert', e);
+        return;
+      }
+
       // --- extract_text ---
-      console.log(step('extract_text'));
+      console.log(stepName('extract_text'));
       let rawText = '';
       try {
         const parsed = await pdfParse(buffer);
         rawText = ((parsed as { text?: string }).text || '').replace(/\s+/g, ' ').trim();
       } catch (e) {
-        console.error(step('extract_text'), e);
+        await setError('extract_text', e);
+        return;
       }
 
       if (!rawText || rawText.length < 30) {
-        console.log(step('manual_required'), 'rawText empty or < 30');
+        console.log(stepName('manual_required'), 'rawText empty or < 30');
         await supabaseAdmin
           .from('prescriptions')
           .update({
@@ -129,8 +229,8 @@ function processPrescriptionPdf(params: ProcessPrescriptionPdfParams): Promise<v
         return;
       }
 
-      // --- parse_ai (avec timeout 15s) ---
-      console.log(step('parse_ai'));
+      // --- parse_ai (timeout 15s) ---
+      console.log(stepName('parse_ai'));
       const openaiKey = process.env.OPENAI_API_KEY;
       let extracted: PrescriptionStruct = {
         date_ordonnance: null,
@@ -148,7 +248,7 @@ function processPrescriptionPdf(params: ProcessPrescriptionPdfParams): Promise<v
             timeoutPromise,
           ]);
         } catch (e) {
-          console.error(step('parse_ai'), e);
+          console.error(stepName('parse_ai'), e);
           await supabaseAdmin
             .from('prescriptions')
             .update({
@@ -171,7 +271,7 @@ function processPrescriptionPdf(params: ProcessPrescriptionPdfParams): Promise<v
       // --- prescription_items_insert ---
       const items = Array.isArray(extracted.items) ? extracted.items : [];
       if (items.length > 0) {
-        console.log(step('prescription_items_insert'));
+        console.log(stepName('prescription_items_insert'));
         type ItemLike = { nom?: string | null; label?: string | null; raw_line?: string | null; [k: string]: unknown };
         const rows = items.slice(0, 500).map((item: ItemLike, index: number) => ({
           prescription_id: prescriptionId,
@@ -184,14 +284,13 @@ function processPrescriptionPdf(params: ProcessPrescriptionPdfParams): Promise<v
         }));
         const { error: itemsErr } = await supabaseAdmin.from('prescription_items').insert(rows);
         if (itemsErr) {
-          console.error(step('prescription_items_insert'), itemsErr);
-          await setError();
+          await setError('prescription_items_insert', itemsErr);
           return;
         }
       }
 
       // --- prescriptions_update (ready) ---
-      console.log(step('prescriptions_update'));
+      console.log(stepName('prescriptions_update'));
       const { error: updateErr } = await supabaseAdmin
         .from('prescriptions')
         .update({
@@ -201,14 +300,19 @@ function processPrescriptionPdf(params: ProcessPrescriptionPdfParams): Promise<v
         })
         .eq('id', prescriptionId);
       if (updateErr) {
-        console.error(step('prescriptions_update'), updateErr);
-        await setError();
+        await setError('prescriptions_update', updateErr);
         return;
       }
-      console.log(step('done'), PrescriptionStatus.READY);
+      console.log(stepName('done'), PrescriptionStatus.READY);
     } catch (err) {
-      console.error(step('exception'), err);
-      await setError();
+      console.error(stepName('exception'), err);
+      await setError('exception', err);
+    } finally {
+      try {
+        await fs.unlink(tmpPath);
+      } catch (_) {
+        // ignore unlink errors (file may already be gone)
+      }
     }
   })();
 }
@@ -346,20 +450,59 @@ router.post(
 );
 
 /**
- * POST /api/prescriptions/import-pdf (2 phases, réponse < 2s)
+ * POST /api/prescriptions/import-pdf/debug
  *
- * Phase 1 (synchrone): Auth Bearer → userId, profile_id (form-data) → 400 si absent, file → 400 si absent.
- * prescriptionId = uuid, storagePath calculé, upload Storage, insert prescriptions (status=processing), insert prescription_files.
- * Réponse immédiate: 200 { ok: true, prescriptionId, status: 'processing' }.
+ * Même multer que import-pdf. Répond immédiatement { ok: true, file: { originalname, mimetype, size } } sans toucher Supabase.
+ * But: isoler si le 502 vient de la lecture multipart/multer ou de la logique métier.
+ */
+router.post(
+  '/import-pdf/debug',
+  uploadImportPdf.single('file'),
+  (req: Request, res: Response) => {
+    try {
+      const fileInfo = getTmpFileInfo(req.file);
+      if (fileInfo) {
+        return res.status(200).json({
+          ok: true,
+          file: {
+            originalname: fileInfo.originalName,
+            mimetype: fileInfo.mimeType,
+            size: fileInfo.sizeBytes,
+          },
+        });
+      }
+      return res.status(400).json({
+        ok: false,
+        error: 'MISSING_FILE',
+        message: 'Le champ fichier "file" est obligatoire',
+      });
+    } catch (err) {
+      console.error('[IMPORT_PDF][debug]', err);
+      if (!res.headersSent) {
+        res.status(500).json({
+          ok: false,
+          error: 'INTERNAL_ERROR',
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+);
+
+/**
+ * POST /api/prescriptions/import-pdf (2 phases, réponse < 1–2s)
  *
- * Phase 2 (async, sans await): processPrescriptionPdf() — extract PDF, si rawText < 30 → manual_required ; sinon OpenAI (timeout 15s) → ready + prescription_items.
+ * Phase 1 (synchrone): token → userId, profile_id, file présent (req.file.path). Insert prescriptions (status=processing). Réponse immédiate: { ok, prescriptionId, status: 'processing', traceId }.
+ *
+ * Phase 2 (async, après res.json, sans await): upload Storage, insert prescription_files (storage_path non-null), extract rawText (pdf-parse), si vide → manual_required, sinon parse IA → items + ready. Cleanup: fs.unlink(tmp). Erreur => status='error' + data={error, step}. Logs: [IMPORT_PDF][traceId][step].
  */
 router.post(
   '/import-pdf',
   requireUser,
+  importPdfLogMiddleware,
   uploadImportPdf.single('file'),
   async (req: Request, res: Response) => {
-    const traceId = randomUUID();
+    const traceId = (req as Request & { importPdfTraceId?: string }).importPdfTraceId ?? randomUUID();
     type ReqWithUser = Request & { userId?: string };
     const reqUser = req as ReqWithUser;
     const userId = reqUser.userId;
@@ -412,7 +555,8 @@ router.post(
       });
     }
 
-    if (!req.file || !req.file.buffer) {
+    const fileInfo = getTmpFileInfo(req.file);
+    if (!fileInfo) {
       return res.status(400).json({
         ok: false,
         error: 'MISSING_FILE',
@@ -420,14 +564,12 @@ router.post(
       });
     }
 
-    console.log(`${LOG_PREFIX}[${traceId}][file]`, { originalname: req.file.originalname, mimetype: req.file.mimetype, size: (req.file.buffer as Buffer).length });
+    const { tmpPath, originalName, mimeType, sizeBytes } = fileInfo;
+    console.log(`${LOG_PREFIX}[${traceId}][file]`, { tmpPath, size: sizeBytes });
 
-    const buffer = req.file.buffer as Buffer;
-    const contentType = req.file.mimetype || 'application/octet-stream';
-    const size = buffer.length;
-    const originalNameForDb = normalizeOriginalFilename(req.file.originalname || 'document.pdf');
+    const originalNameForDb = normalizeOriginalFilename(originalName);
     const prescriptionId = randomUUID();
-    // storagePath calculé AVANT upload, puis réutilisé pour l'insert prescription_files (NOT NULL).
+    // storagePath calculé AVANT upload (upload fait en async dans processPrescriptionPdf).
     const storagePath = getPrescriptionStoragePathDeterministic(userId, profileId, prescriptionId, originalNameForDb);
     if (!storagePath || !storagePath.trim()) {
       return res.status(500).json({
@@ -437,40 +579,9 @@ router.post(
         traceId,
       });
     }
-    console.log(`${LOG_PREFIX}[${traceId}][storage_upload]`);
 
-    try {
-      await uploadBufferToStorage({
-        bucket: BUCKET,
-        path: storagePath,
-        buffer,
-        contentType,
-      });
-    } catch (storageErr: unknown) {
-      const err = storageErr as Error & { message?: string; code?: string; statusCode?: number };
-      console.error(`${LOG_PREFIX}[${traceId}][storage_upload]`, err);
-      if (isBucketNotFoundError(storageErr)) {
-        return res.status(500).json({
-          ok: false,
-          error: 'BUCKET_NOT_FOUND',
-          message: 'Le bucket Storage "prescriptions" est introuvable. Créez-le dans le dashboard Supabase ou vérifiez la config.',
-          details: err?.message ?? null,
-          traceId,
-        });
-      }
-      const details =
-        err instanceof Error
-          ? { message: err.message, name: err.name, ...(err as Record<string, unknown>) }
-          : (storageErr as Record<string, unknown>);
-      return res.status(500).json({
-        ok: false,
-        error: 'STORAGE_UPLOAD_FAILED',
-        step: 'storage_upload',
-        message: err?.message ?? 'Upload Storage échoué',
-        details,
-        traceId,
-      });
-    }
+    // IMPORTANT: ne jamais lire tout le fichier en Buffer avant d'avoir renvoyé l'ACK JSON.
+    // L'upload Storage + extraction PDF se font dans processPrescriptionPdf (après ACK).
 
     type SupabaseErrorLike = { code?: string; message?: string; details?: string; hint?: string };
     console.log(`${LOG_PREFIX}[${traceId}][prescriptions_insert]`);
@@ -512,53 +623,24 @@ router.post(
       });
     }
 
-    console.log(`${LOG_PREFIX}[${traceId}][prescription_files_insert]`);
-    const filesInsertPayload: Record<string, unknown> = {
-      prescription_id: prescriptionId,
-      user_id: userId,
-      profile_id: profileId,
-      storage_path: storagePath,
-      original_name: req.file.originalname ?? originalNameForDb,
-      mime_type: contentType,
-      size_bytes: size,
-      meta: { source: 'pdf' },
-    };
-    const { error: fileError } = await supabaseAdmin.from('prescription_files').insert(filesInsertPayload);
-    if (fileError) {
-      const e = fileError as SupabaseErrorLike;
-      console.error(`${LOG_PREFIX}[${traceId}][prescription_files_insert]`, e.code, e.message);
-      await supabaseAdmin.from('prescriptions').update({ status: PrescriptionStatus.ERROR }).eq('id', prescriptionId);
-      if (e.code === 'PGRST204' || String(e.message ?? '').includes('not found in schema cache')) {
-        const columnMatch = String(e.message ?? '').match(/'([^']+)'/);
-        const columnHint = columnMatch ? columnMatch[1] : 'unknown';
-        return res.status(500).json({
-          ok: false,
-          error: 'SCHEMA_CACHE_OUTDATED',
-          step: 'prescription_files_insert',
-          message: `Colonne manquante/${columnHint}`,
-          traceId,
-        });
-      }
-      return res.status(500).json({
-        ok: false,
-        error: 'DB_INSERT_FAILED',
-        step: 'prescription_files_insert',
-        code: e.code ?? null,
-        message: e.message ?? null,
-        traceId,
-      });
-    }
-
-      // Réponse immédiate (< 2s) ; traitement PDF/OpenAI en async (processPrescriptionPdf).
-      res.status(200).json({ ok: true, prescriptionId, status: PrescriptionStatus.PROCESSING });
-      processPrescriptionPdf({
-        prescriptionId,
-        userId,
-        profileId,
-        storagePath,
-        buffer,
-        traceId,
-      }).catch((err) => console.error(`${LOG_PREFIX}[${traceId}][processPrescriptionPdf]`, err));
+    // Phase 1 terminée : répondre immédiatement (< 1–2s). Phase 2 (upload, prescription_files, extract, IA) en async.
+    res.status(200).json({
+      ok: true,
+      prescriptionId,
+      status: PrescriptionStatus.PROCESSING,
+      traceId,
+    });
+    processPrescriptionPdf({
+      prescriptionId,
+      userId,
+      profileId,
+      storagePath,
+      tmpPath,
+      contentType: mimeType,
+      originalName: originalName ?? originalNameForDb,
+      sizeBytes,
+      traceId,
+    }).catch((err) => console.error(`${LOG_PREFIX}[${traceId}][processPrescriptionPdf]`, err));
     } catch (err) {
       console.error(`${LOG_PREFIX}[${traceId}][sync_error]`, err);
       if (!res.headersSent) {
@@ -902,6 +984,21 @@ router.patch('/:id', requireUser, async (req: Request, res: Response) => {
       ok: false,
       error: 'INTERNAL_ERROR',
       message: 'Erreur serveur',
+    });
+  }
+});
+
+// Erreurs (ex: multer LIMIT_FILE_SIZE) → toujours répondre en JSON, 413 si fichier trop gros.
+router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const message = err instanceof Error ? err.message : String(err);
+  const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : null;
+  console.error('[PRESCRIPTIONS] router error', code, message);
+  if (!res.headersSent) {
+    const isTooLarge = code === 'LIMIT_FILE_SIZE';
+    res.status(isTooLarge ? 413 : 400).json({
+      ok: false,
+      error: isTooLarge ? 'FILE_TOO_LARGE' : 'ROUTER_ERROR',
+      message: isTooLarge ? 'Fichier trop volumineux (max 10 Mo).' : message,
     });
   }
 });

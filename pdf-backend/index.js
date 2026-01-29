@@ -13,6 +13,18 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   );
 }
 
+// ===== HANDLERS GLOBAUX ANTI-CRASH (toujours répondre / log, ne jamais laisser une promise non catch) =====
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT_EXCEPTION]', err?.message ?? err);
+  console.error('[UNCAUGHT_EXCEPTION] stack:', err?.stack);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[UNHANDLED_REJECTION] reason:', reason);
+  console.error('[UNHANDLED_REJECTION] promise:', promise);
+});
+
 // Logs sécurisés des variables d'environnement
 logEnvStatus();
 
@@ -182,7 +194,7 @@ console.log('[ORDONNANCES] routes mounted (POST /ordonnances/:id/recovered)');
 // ===== ROUTES PRESCRIPTIONS (import ordonnance PDF) =====
 import prescriptionsRouter from './src/routes/prescriptions.js';
 app.use('/api/prescriptions', prescriptionsRouter);
-console.log('[PRESCRIPTIONS] routes mounted (GET /api/prescriptions, GET /api/prescriptions/:id, PATCH /api/prescriptions/:id, POST /api/prescriptions/import, POST /api/prescriptions/import-pdf)');
+console.log('[PRESCRIPTIONS] routes mounted (GET /api/prescriptions, GET /api/prescriptions/:id, PATCH /api/prescriptions/:id, POST /api/prescriptions/import, POST /api/prescriptions/import-pdf, POST /api/prescriptions/import-pdf/debug)');
 
 // ===== ROUTES DEVICES =====
 import devicesRouter from './routes/devices.routes.js';
