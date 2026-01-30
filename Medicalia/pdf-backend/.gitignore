@@ -1,5 +1,12 @@
 node_modules/
 .env
+.env.local
+.env.*.local
 *.log
 .DS_Store
 
+# BDPM index (généré localement)
+data/bdpm_index.json# TypeScript
+*.tsbuildinfo
+dist/
+build/
