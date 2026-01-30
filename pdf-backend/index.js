@@ -2371,7 +2371,6 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
   
   // 3. Fallback : OCR avec l'image originale
   console.log('[OCR_FALLBACK] Tentative OCR avec image originale');
-  console.log('[OCR_FALLBACK] Original image data URL length:', originalImageDataUrl.length);
   
   let originalBase64Data = base64Image;
   if (base64Image.startsWith('data:')) {
@@ -2380,6 +2379,7 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
     }
   }
   const originalImageDataUrl = `data:${mimeType};base64,${originalBase64Data}`;
+  console.log('[OCR_FALLBACK] Original image data URL length:', originalImageDataUrl.length);
   
   const abortController2 = new AbortController();
   const timeoutId2 = setTimeout(() => {
