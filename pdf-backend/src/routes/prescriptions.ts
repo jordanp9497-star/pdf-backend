@@ -87,12 +87,13 @@ const uploadImportPdf = multer({
 });
 
 const PHOTO_UPLOAD_LIMIT = 10 * 1024 * 1024; // 10MB
-/** Multer pour import-photo : champ "file", image/jpeg (ou image/png), 10MB. */
+/** Multer pour import-photo : champ "file", image/jpeg/png/webp/heic/heif, 10MB. */
 const uploadImportPhoto = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: PHOTO_UPLOAD_LIMIT },
   fileFilter: (_req, file, cb) => {
-    const ok = /^image\/(jpeg|jpg|png)$/.test(file.mimetype || '');
+    // Support formats modernes : WebP (Android), HEIC/HEIF (iOS)
+    const ok = /^image\/(jpeg|jpg|png|webp|heic|heif)$/i.test(file.mimetype || '');
     cb(null, ok);
   },
 });
@@ -1444,6 +1445,8 @@ type PatchPrescriptionBody = {
  *
  * Sauvegarde écran de vérification. Auth requireUser.
  * Update prescriptions (status, date_ordonnance, medecin_*, patient_*, document_kind, doc_context, pregnancy_month).
+ * document_kind in: medicament, rdv, biologie, compte_rendu, imagerie, certificat, autre.
+ * doc_context in: general, pregnancy, child.
  * Upsert items : item.id présent => update, sinon insert ; supprimer les items absents de la liste si items fourni.
  * Retour: { ok: true, prescription } (objet prescription mis à jour).
  */
