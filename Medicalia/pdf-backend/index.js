@@ -2277,6 +2277,8 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
   
   // 2. Tenter l'OCR avec l'image pré-traitée
   console.log('[OCR_FALLBACK] Tentative OCR avec image pré-traitée');
+  console.log('[OCR_FALLBACK] Image data URL length:', imageDataUrl.length);
+  console.log('[OCR_FALLBACK] MISTRAL_API_KEY present:', !!mistralApiKey, 'length:', mistralApiKey?.length);
   
   const abortController1 = new AbortController();
   const timeoutMs = 60000; // 60 secondes
@@ -2285,6 +2287,7 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
   }, timeoutMs);
   
   try {
+    console.log('[OCR_FALLBACK] Envoi requête Mistral attempt 1...');
     const ocrRes1 = await fetch('https://api.mistral.ai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -2344,6 +2347,7 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
         const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 30000;
         
         console.warn(`[OCR_FALLBACK] ❌ Rate limit Mistral (429), retryAfter: ${retryAfter}ms`);
+        console.warn(`[OCR_FALLBACK] Response body:`, errorText);
         
         const error = new Error(`OCR Mistral rate limit: ${ocrRes1.status} - ${errorText}`);
         error.status = 429;
@@ -2353,7 +2357,8 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
         
         throw error;
       }
-      console.warn(`[OCR_FALLBACK] Erreur OCR pré-traité: status=${ocrRes1.status}`);
+      const errorBody = await ocrRes1.text();
+      console.warn(`[OCR_FALLBACK] Erreur OCR pré-traité: status=${ocrRes1.status}, body:`, errorBody);
     }
   } catch (error) {
     clearTimeout(timeoutId1);
@@ -2366,6 +2371,7 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
   
   // 3. Fallback : OCR avec l'image originale
   console.log('[OCR_FALLBACK] Tentative OCR avec image originale');
+  console.log('[OCR_FALLBACK] Original image data URL length:', originalImageDataUrl.length);
   
   let originalBase64Data = base64Image;
   if (base64Image.startsWith('data:')) {
@@ -2381,6 +2387,7 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
   }, timeoutMs);
   
   try {
+    console.log('[OCR_FALLBACK] Envoi requête Mistral attempt 2 (fallback)...');
     const ocrRes2 = await fetch('https://api.mistral.ai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -2606,13 +2613,22 @@ app.post('/ocr-photo', async (req, res) => {
       }
     }
 
-    // Utiliser ocrWithFallback qui gère le pré-traitement et le fallback automatiquement
+     // Utiliser ocrWithFallback qui gère le pré-traitement et le fallback automatiquement
     console.log("[OCR-PHOTO] checkpoint B: avant appel OCR avec fallback");
+    console.log("[OCR-PHOTO] base64 length:", base64.length, "mimeType:", mimeType);
     let ocrResult;
     try {
       ocrResult = await ocrWithFallback(base64, mimeType, mistralApiKey);
     } catch (ocrError) {
       const totalDuration = Date.now() - t0;
+      console.error('[OCR PHOTO] ❌ Erreur OCR complète:', {
+        message: ocrError.message,
+        status: ocrError.status || ocrError.statusCode,
+        code: ocrError.code || ocrError.errorCode,
+        retryAfter: ocrError.retryAfter || ocrError.retryAfterMs,
+        stack: ocrError.stack?.split('\n')[0] // Première ligne de la stack
+      });
+      
       if (ocrError.message.includes('timeout')) {
         console.error('[OCR PHOTO] ❌ Timeout Mistral');
         console.log(`[OCR-PHOTO] checkpoint D: erreur MISTRAL_TIMEOUT - temps total: ${totalDuration}ms`);
@@ -2622,7 +2638,7 @@ app.post('/ocr-photo', async (req, res) => {
           message: 'OCR Mistral trop long'
         });
       }
-      console.error('[OCR PHOTO] ❌ Erreur OCR:', ocrError.message);
+      console.error('[OCR PHOTO] ❌ Erreur OCR message:', ocrError.message);
       throw ocrError;
     }
 
@@ -2800,14 +2816,25 @@ Règles strictes:
     return res.status(200).json(transformed);
 
   } catch (e) {
-    console.error("[OCR] ERROR", e.message || e);
+    console.error("[OCR] ERROR DÉTAILLÉE:", {
+      message: e.message || String(e),
+      status: e.status || e.statusCode,
+      code: e.code || e.errorCode,
+      retryAfter: e.retryAfter || e.retryAfterMs,
+      name: e.name,
+    });
     if (e.stack) {
       console.error("[OCR] Stack:", e.stack);
     }
     const totalDuration = Date.now() - t0;
     console.log(`[OCR-PHOTO] checkpoint D: erreur dans catch - temps total: ${totalDuration}ms`);
+    
+    // Retourner plus de détails pour le debug
     return res.status(500).json({ 
-      error: "OCR_FAILED"
+      error: "OCR_FAILED",
+      details: e.message || String(e),
+      code: e.code || e.errorCode || null,
+      status: e.status || e.statusCode || 500
     });
   }
 });
