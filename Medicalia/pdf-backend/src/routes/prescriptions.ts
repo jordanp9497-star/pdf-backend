@@ -580,6 +580,9 @@ router.post(
     const { tmpPath, originalName, mimeType, sizeBytes } = fileInfo;
     console.log(`${LOG_PREFIX}[${traceId}][file]`, { tmpPath, size: sizeBytes });
 
+    const needsManualRaw = req.body?.needsManual ?? req.body?.needs_manual;
+    const needsManual = String(needsManualRaw ?? '').toLowerCase() === 'true';
+
     const originalNameForDb = normalizeOriginalFilename(originalName);
     const prescriptionId = randomUUID();
     const storagePath = getPrescriptionStoragePathDeterministic(userId, profileId, prescriptionId, originalNameForDb);
@@ -600,8 +603,8 @@ router.post(
       user_id: userId,
       owner_user_id: userId,
       profile_id: profileId,
-      status: PrescriptionStatus.MANUAL_REQUIRED,
-      needs_review: true,
+      status: needsManual ? PrescriptionStatus.MANUAL_REQUIRED : PrescriptionStatus.PROCESSING,
+      needs_review: needsManual ? true : false,
       document_kind: 'medicament',
       doc_context: 'general',
       raw_text: null,
@@ -687,10 +690,12 @@ router.post(
       .select('id')
       .single();
 
-    try {
-      await fs.unlink(tmpPath);
-    } catch (_) {
-      // ignore
+    if (needsManual) {
+      try {
+        await fs.unlink(tmpPath);
+      } catch (_) {
+        // ignore
+      }
     }
 
     if (fileErr || !fileRow) {
@@ -704,6 +709,21 @@ router.post(
       });
     }
 
+    // Lancer le traitement OCR/parse en background si mode auto
+    if (!needsManual) {
+      processPrescriptionPdf({
+        prescriptionId,
+        userId,
+        profileId,
+        storagePath,
+        tmpPath,
+        contentType: mimeType,
+        originalName: originalNameForDb,
+        sizeBytes,
+        traceId,
+      }).catch((e) => console.error(`${LOG_PREFIX}[${traceId}][process_async]`, e));
+    }
+
     return res.status(200).json({
       ok: true,
       prescription_id: prescriptionId,
@@ -715,6 +735,8 @@ router.post(
       fileId: fileRow.id,
       mimeType: mimeType,
       storagePath: storagePath,
+      status: needsManual ? PrescriptionStatus.MANUAL_REQUIRED : PrescriptionStatus.PROCESSING,
+      needs_manual: needsManual,
     });
     } catch (err) {
       console.error(`${LOG_PREFIX}[${traceId}][sync_error]`, err);
