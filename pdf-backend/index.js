@@ -2480,9 +2480,82 @@ async function ocrWithFallback(base64Image, mimeType, mistralApiKey) {
   } catch (error) {
     clearTimeout(timeoutId2);
     if (error.name === 'AbortError') {
-      throw new Error('OCR Mistral timeout après 60 secondes');
+      console.warn('[OCR_FALLBACK] Timeout Mistral sur image originale');
+    } else {
+      console.warn('[OCR_FALLBACK] Erreur Mistral sur image originale:', error.message);
     }
-    throw error;
+    
+    // 4. Fallback ultime : OpenAI Vision si Mistral a complètement échoué
+    console.log('[OCR_FALLBACK] Tentative fallback ultime avec OpenAI Vision...');
+    
+    const OPENAI_KEY = process.env.OPENAI_API_KEY;
+    if (!OPENAI_KEY) {
+      console.error('[OCR_FALLBACK] ❌ OPENAI_API_KEY non disponible pour fallback');
+      throw new Error('OCR Mistral failed et OpenAI Vision non disponible (clé manquante)');
+    }
+    
+    console.log('[OCR_FALLBACK] OPENAI_API_KEY présente:', !!OPENAI_KEY, 'length:', OPENAI_KEY?.length);
+    
+    try {
+      console.log('[OCR_FALLBACK] Envoi requête OpenAI Vision...');
+      const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENAI_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { 
+                  type: 'text', 
+                  text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut sans commentaire ni formatage markdown.' 
+                },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: originalImageDataUrl,
+                    detail: 'high'
+                  }
+                }
+              ]
+            }
+          ],
+          max_tokens: 2000
+        })
+      });
+      
+      if (!openaiRes.ok) {
+        const errorText = await openaiRes.text();
+        console.error('[OCR_FALLBACK] ❌ Erreur OpenAI Vision:', openaiRes.status, errorText);
+        throw new Error(`OpenAI Vision failed: ${openaiRes.status} - ${errorText}`);
+      }
+      
+      const openaiData = await openaiRes.json();
+      const textOpenAI = openaiData.choices?.[0]?.message?.content || '';
+      const textLengthOpenAI = textOpenAI.trim().length;
+      const scoreOCROpenAI = Math.min(1, textLengthOpenAI / 500);
+      
+      console.log('[OCR_FALLBACK] ✅ OpenAI Vision réussi, texte:', textLengthOpenAI, 'caractères');
+      
+      return {
+        text: textOpenAI,
+        meta: {
+          usedPreprocess: usedPreprocess,
+          fallback: true,
+          fallbackProvider: 'openai-vision',
+          scoreOCR: scoreOCROpenAI
+        }
+      };
+      
+    } catch (openaiError) {
+      console.error('[OCR_FALLBACK] ❌ Échec fallback OpenAI Vision:', openaiError.message);
+      // Si OpenAI échoue aussi, throw l'erreur originale Mistral
+      throw new Error(`OCR failed - Mistral: ${error.message}, OpenAI: ${openaiError.message}`);
+    }
   }
 }
 
