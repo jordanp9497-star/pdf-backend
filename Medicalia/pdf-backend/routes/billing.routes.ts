@@ -7,7 +7,7 @@
  * POST /billing/webhook - Webhook Stripe pour mettre à jour les abonnements
  */
 
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { stripe } from '../src/lib/stripe.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
@@ -33,7 +33,7 @@ const PREMIUM_PRICE_ID = 'price_1SsTI3L9JokDSsqLuZralNuv';
  * Champs exposés: id, display_name, monthly_price_cents, annual_price_cents, highlight, features.
  * Tri: highlight desc, puis prix (monthly_price_cents).
  */
-router.get('/plans', async (req, res) => {
+router.get('/plans', async (req: Request, res: Response) => {
   try {
     if (!supabase) {
       return res.status(500).json({
@@ -59,7 +59,7 @@ router.get('/plans', async (req, res) => {
     }
 
     // Ne renvoyer que premium_monthly et premium_annual (exclut ancien 2,99€ ou autre "premium")
-    const filtered = (plans ?? []).filter((p) => p && VISIBLE_PLAN_IDS.includes(p.id));
+    const filtered = (plans ?? []).filter((p: any) => p && VISIBLE_PLAN_IDS.includes(p.id));
 
     res.set({
       'Cache-Control': 'no-store, no-cache, must-revalidate',
@@ -82,9 +82,9 @@ router.get('/plans', async (req, res) => {
 
 /**
  * Helper: Vérifie si un utilisateur est abonné (actif)
- * 
- * @param {string} userId - ID de l'utilisateur
- * @returns {Promise<boolean>} - true si l'utilisateur a un abonnement actif
+ *
+ * @param userId - ID de l'utilisateur
+ * @returns true si l'utilisateur a un abonnement actif
  */
 /**
  * GET /billing/me
@@ -92,9 +92,9 @@ router.get('/plans', async (req, res) => {
  * Retourne entitlements / premium pour l'utilisateur authentifié.
  * pregnancy_pack_enabled = (entitlement normal isPro) OR feature override 'pregnancy_pack'.
  */
-router.get('/me', authenticateSupabase, async (req, res) => {
+router.get('/me', authenticateSupabase, async (req: Request, res: Response) => {
   try {
-    const userId = req.userId || req.user?.id;
+    const userId = (req as any).userId || (req as any).user?.id;
     if (!userId) {
       return res.status(401).json({
         ok: false,
@@ -131,7 +131,7 @@ router.get('/me', authenticateSupabase, async (req, res) => {
   }
 });
 
-export async function isSubscribed(userId) {
+export async function isSubscribed(userId: string): Promise<boolean> {
   if (!supabase || !userId) {
     return false;
   }
@@ -161,18 +161,18 @@ export async function isSubscribed(userId) {
 
 /**
  * POST /billing/create-checkout-session
- * 
+ *
  * Crée une session de checkout Stripe pour l'abonnement Premium
  * - Requiert authentification (ou fallback x-user-id en dev)
  * - Refuse tout priceId venant du client (sécurité)
  * - Utilise uniquement le Price ID Premium hardcodé
  * - Retourne l'URL de checkout
- * 
+ *
  * Retourne: { url: string }
  */
 router.post('/create-checkout-session',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Sécurité: Refuser tout priceId venant du client
       if (req.body && req.body.priceId) {
@@ -185,19 +185,19 @@ router.post('/create-checkout-session',
       }
 
       // Récupérer userId: req.user.id (auth) > x-user-id (dev fallback) > "anonymous"
-      let userId = null;
-      if (req.user && req.user.id) {
-        userId = req.user.id;
+      let userId: string | null = null;
+      if ((req as any).user && (req as any).user.id) {
+        userId = (req as any).user.id;
       } else if (req.headers['x-user-id']) {
-        userId = req.headers['x-user-id'];
+        userId = req.headers['x-user-id'] as string;
         console.log('[BILLING] ⚠️ Utilisation de x-user-id header (dev fallback)');
       } else {
         userId = 'anonymous';
       }
 
-      console.log('[BILLING] create-checkout-session', { 
-        userId, 
-        hasAppBaseUrl: !!APP_CONFIG.baseUrl 
+      console.log('[BILLING] create-checkout-session', {
+        userId,
+        hasAppBaseUrl: !!APP_CONFIG.baseUrl
       });
 
       if (!supabase) {
@@ -209,7 +209,7 @@ router.post('/create-checkout-session',
       }
 
       // Récupérer ou créer le customer Stripe (uniquement si userId n'est pas "anonymous")
-      let stripeCustomerId = null;
+      let stripeCustomerId: string | null = null;
 
       if (userId !== 'anonymous') {
         // Vérifier si l'utilisateur a déjà un customer Stripe
@@ -225,7 +225,7 @@ router.post('/create-checkout-session',
           // Créer un nouveau customer Stripe
           const customer = await stripe.customers.create({
             metadata: {
-              userId: userId
+              userId: userId as string
             }
           });
 
@@ -255,7 +255,7 @@ router.post('/create-checkout-session',
 
       // Créer la session de checkout avec le Price ID Premium hardcodé
       const session = await stripe.checkout.sessions.create({
-        customer: stripeCustomerId,
+        customer: stripeCustomerId!,
         payment_method_types: ['card'],
         line_items: [
           {
@@ -266,9 +266,9 @@ router.post('/create-checkout-session',
         mode: 'subscription',
         success_url: `${APP_CONFIG.baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${APP_CONFIG.baseUrl}/billing/cancel`,
-        client_reference_id: userId !== 'anonymous' ? userId : undefined,
+        client_reference_id: userId !== 'anonymous' ? userId! : undefined,
         metadata: {
-          userId: userId
+          userId: userId as string
         }
       });
 
@@ -289,7 +289,7 @@ router.post('/create-checkout-session',
         url: session.url
       });
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('[BILLING] ❌ Erreur lors de la création de la session:', error);
       return res.status(500).json({
         ok: false,
@@ -302,28 +302,28 @@ router.post('/create-checkout-session',
 
 /**
  * Handler pour le webhook Stripe
- * 
+ *
  * Webhook Stripe pour mettre à jour les abonnements
  * - Pas d'authentification (signature Stripe vérifiée)
  * - Gère les événements: checkout.session.completed, customer.subscription.updated, customer.subscription.deleted
- * 
+ *
  * NOTE: Le body parser raw est appliqué dans index.js AVANT express.json()
  * Cette fonction est exportée pour être utilisée directement dans index.js
  */
-export async function handleStripeWebhook(req, res) {
-  const sig = req.headers['stripe-signature'];
+export async function handleStripeWebhook(req: Request, res: Response) {
+  const sig = req.headers['stripe-signature'] as string;
 
   if (!stripe) {
     console.error('[BILLING] ❌ Stripe non configuré');
     return res.status(500).json({ error: 'Configuration manquante' });
   }
 
-  let event;
+  let event: any;
 
   try {
     // Vérifier la signature du webhook
     event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_CONFIG.webhookSecret);
-  } catch (err) {
+  } catch (err: any) {
     console.error('[BILLING] ❌ Erreur de signature webhook:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
@@ -353,7 +353,7 @@ export async function handleStripeWebhook(req, res) {
             stripe_customer_id: session.customer,
             stripe_subscription_id: subscription.id,
             status: subscription.status,
-            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            current_period_end: new Date((subscription as any).current_period_end * 1000).toISOString(),
             updated_at: new Date().toISOString()
           }, {
             onConflict: 'user_id'
@@ -434,11 +434,11 @@ export async function handleStripeWebhook(req, res) {
 
 /**
  * GET /billing/success
- * 
+ *
  * Endpoint de redirection après succès du checkout Stripe
  * Retourne simplement un statut OK
  */
-router.get('/success', (req, res) => {
+router.get('/success', (req: Request, res: Response) => {
   const sessionId = req.query.session_id;
   console.log('[BILLING] ✅ Redirect success', { sessionId });
   res.status(200).send('OK');
@@ -446,11 +446,11 @@ router.get('/success', (req, res) => {
 
 /**
  * GET /billing/cancel
- * 
+ *
  * Endpoint de redirection après annulation du checkout Stripe
  * Retourne simplement un statut CANCELED
  */
-router.get('/cancel', (req, res) => {
+router.get('/cancel', (req: Request, res: Response) => {
   console.log('[BILLING] ❌ Redirect cancel');
   res.status(200).send('CANCELED');
 });

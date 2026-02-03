@@ -1,10 +1,11 @@
 /**
  * Routes pour la gestion des ordonnances
- * 
+ *
  * POST /ordonnances/:id/recovered - Marquer une ordonnance comme récupérée
  */
 
 import express from 'express';
+import type { Request, Response } from 'express';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
 
@@ -15,30 +16,30 @@ const supabase = supabaseAdmin;
 
 /**
  * POST /ordonnances/:id/recovered
- * 
+ *
  * Marque une ordonnance comme récupérée
  * - Requiert authentification (Bearer token Supabase)
  * - Valide req.params.id et req.body.recoveredAt
  * - Met à jour recovered_at dans la table ordonnances
  * - Si l'ordonnance n'existe pas, la crée à la volée (MVP)
- * 
- * Body: { 
+ *
+ * Body: {
  *   recoveredAt: string (ISO date),
  *   ordonnance?: object (optionnel, données supplémentaires à stocker dans data)
  * }
- * Retourne: { 
- *   ok: true, 
- *   ordonnanceId: string, 
+ * Retourne: {
+ *   ok: true,
+ *   ordonnanceId: string,
  *   recoveredAt: string,
  *   created: boolean (true si créée, false si mise à jour)
  * }
  */
 router.post('/:id/recovered',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      if (!req.user || !req.user.id) {
+      if (!(req as any).user || !(req as any).user.id) {
         return res.status(401).json({
           ok: false,
           error: 'UNAUTHORIZED',
@@ -85,14 +86,14 @@ router.post('/:id/recovered',
       }
 
       // Optionnel: valider le champ ordonnance si fourni
-      let ordonnanceData = {};
+      let ordonnanceData: Record<string, unknown> = {};
       if (ordonnance && typeof ordonnance === 'object') {
         ordonnanceData = ordonnance;
       }
 
       // Utiliser req.userId (défini par authenticateSupabase)
-      const userId = req.userId || req.user?.id;
-      
+      const userId = (req as any).userId || (req as any).user?.id;
+
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -138,7 +139,7 @@ router.post('/:id/recovered',
           });
 
           // Vérifier si c'est une erreur de table manquante
-          if (checkError.code === '42P01' || 
+          if (checkError.code === '42P01' ||
               checkError.message?.toLowerCase().includes('relation') ||
               checkError.message?.toLowerCase().includes('does not exist') ||
               (checkError.message?.toLowerCase().includes('table') && checkError.message?.toLowerCase().includes('not found'))) {
@@ -188,7 +189,7 @@ router.post('/:id/recovered',
           });
 
           // Vérifier si c'est une erreur de table manquante
-          if (upsertError.code === '42P01' || 
+          if (upsertError.code === '42P01' ||
               upsertError.message?.toLowerCase().includes('relation') ||
               upsertError.message?.toLowerCase().includes('does not exist') ||
               (upsertError.message?.toLowerCase().includes('table') && upsertError.message?.toLowerCase().includes('not found'))) {
@@ -245,7 +246,7 @@ router.post('/:id/recovered',
           created: isCreated
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         // Log détaillé de l'exception
         console.error('[ORDONNANCES] update recovered failed', {
           id: ordonnanceId,
@@ -264,11 +265,11 @@ router.post('/:id/recovered',
         });
       }
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('[ORDONNANCES] ❌ Erreur inattendue:', error);
-      
+
       // Réponse 500 avec debug en DEV
-      const response = {
+      const response: Record<string, unknown> = {
         ok: false,
         error: 'INTERNAL_ERROR',
         message: 'Erreur lors de la mise à jour de l\'ordonnance'

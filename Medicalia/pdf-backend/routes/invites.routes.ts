@@ -1,13 +1,13 @@
 /**
  * Routes pour la gestion des invitations de profils
- * 
+ *
  * POST /profiles/:profileId/invites - Créer une invitation (OWNER uniquement) [LEGACY]
  * POST /invites/accept - Accepter une invitation avec un code [LEGACY]
  * POST /invites/create - Créer une invitation avec code hashé (PREMIUM uniquement)
  * POST /invites/redeem - Utiliser un code d'invitation (aidant)
  */
 
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { createHash } from 'crypto';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { requireProfileRole } from '../middlewares/profileRole.js';
@@ -27,24 +27,24 @@ const INVITE_HASH_SECRET = process.env.INVITE_HASH_SECRET || 'medicalia-invite-s
  * Génère un code d'invitation aléatoire de 8 caractères (humain-friendly)
  * Utilise des caractères alphanumériques (sans caractères ambigus)
  */
-function generateInviteCode(length = 8) {
+function generateInviteCode(length: number = 8): string {
   // Caractères utilisables (sans 0, O, I, l pour éviter les confusions)
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  
+
   let code = '';
   for (let i = 0; i < length; i++) {
     code += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  
+
   return code;
 }
 
 /**
  * Hash un code d'invitation avec SHA256 + salt secret
- * @param {string} code - Code en clair
- * @returns {string} - Hash hexadécimal
+ * @param code - Code en clair
+ * @returns Hash hexadécimal
  */
-function hashInviteCode(code) {
+function hashInviteCode(code: string): string {
   const normalized = code.trim().toUpperCase();
   return createHash('sha256')
     .update(normalized + INVITE_HASH_SECRET)
@@ -53,19 +53,19 @@ function hashInviteCode(code) {
 
 /**
  * POST /profiles/:profileId/invites
- * 
+ *
  * Crée une invitation pour un profil
  * - Requiert authentification + rôle OWNER
  * - Génère un code aléatoire de 8-10 caractères
  * - Expire dans 7 jours
- * 
+ *
  * Retourne: { code, expires_at }
  */
 router.post('/profiles/:profileId/invites',
   authenticateSupabase,
   requireSubscription, // Feature premium: nécessite un abonnement
   requireProfileRole('profileId', ['owner']),
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       const profileId = req.params.profileId;
 
@@ -78,7 +78,7 @@ router.post('/profiles/:profileId/invites',
       }
 
       // Générer un code unique
-      let code;
+      let code: string = '';
       let attempts = 0;
       const maxAttempts = 10;
 
@@ -118,7 +118,7 @@ router.post('/profiles/:profileId/invites',
           profile_id: profileId,
           code: code,
           expires_at: expiresAt.toISOString(),
-          created_by: req.user.id,
+          created_by: (req as any).user.id,
           created_at: new Date().toISOString()
         })
         .select('code, expires_at')
@@ -133,7 +133,7 @@ router.post('/profiles/:profileId/invites',
         });
       }
 
-      console.log(`[INVITES] ✅ Invitation créée pour profil ${profileId} par ${req.user.id}`);
+      console.log(`[INVITES] ✅ Invitation créée pour profil ${profileId} par ${(req as any).user.id}`);
 
       return res.status(201).json({
         ok: true,
@@ -154,22 +154,22 @@ router.post('/profiles/:profileId/invites',
 
 /**
  * POST /invites/accept
- * 
+ *
  * Accepte une invitation avec un code
  * - Requiert authentification
  * - Vérifie que le code est valide, non expiré et non utilisé
  * - Crée une entrée dans profile_members avec role='AIDANT'
  * - Marque l'invitation comme utilisée (used_by, used_at)
- * 
+ *
  * Body: { code: string }
  * Retourne: { profileId }
  */
 router.post('/invites/accept',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      if (!req.user || !req.user.id) {
+      if (!(req as any).user || !(req as any).user.id) {
         return res.status(401).json({
           ok: false,
           error: 'UNAUTHORIZED',
@@ -233,7 +233,7 @@ router.post('/invites/accept',
       // Vérifier que l'invitation n'est pas expirée
       const now = new Date();
       const expiresAt = new Date(invite.expires_at);
-      
+
       if (now > expiresAt) {
         console.log(`[INVITES] ❌ Code expiré: ${code}`);
         return res.status(400).json({
@@ -248,11 +248,11 @@ router.post('/invites/accept',
         .from('profile_members')
         .select('id')
         .eq('profile_id', invite.profile_id)
-        .eq('user_id', req.user.id)
+        .eq('user_id', (req as any).user.id)
         .single();
 
       if (existingMember) {
-        console.log(`[INVITES] ❌ Utilisateur ${req.user.id} déjà membre du profil ${invite.profile_id}`);
+        console.log(`[INVITES] ❌ Utilisateur ${(req as any).user.id} déjà membre du profil ${invite.profile_id}`);
         return res.status(400).json({
           ok: false,
           error: 'ALREADY_MEMBER',
@@ -266,7 +266,7 @@ router.post('/invites/accept',
         .from('profile_members')
         .insert({
           profile_id: invite.profile_id,
-          user_id: req.user.id,
+          user_id: (req as any).user.id,
           role: 'AIDANT',
           created_at: new Date().toISOString()
         })
@@ -286,7 +286,7 @@ router.post('/invites/accept',
       const { error: updateError } = await supabase
         .from('profile_invites')
         .update({
-          used_by: req.user.id,
+          used_by: (req as any).user.id,
           used_at: new Date().toISOString()
         })
         .eq('id', invite.id);
@@ -297,7 +297,7 @@ router.post('/invites/accept',
         // L'utilisateur est déjà membre, donc c'est OK
       }
 
-      console.log(`[INVITES] ✅ Invitation acceptée: utilisateur ${req.user.id} ajouté au profil ${invite.profile_id}`);
+      console.log(`[INVITES] ✅ Invitation acceptée: utilisateur ${(req as any).user.id} ajouté au profil ${invite.profile_id}`);
 
       return res.status(200).json({
         ok: true,
@@ -321,23 +321,23 @@ router.post('/invites/accept',
 
 /**
  * POST /invites/create
- * 
+ *
  * Crée une invitation avec code hashé (sécurisé)
  * - Requiert authentification
  * - Requiert abonnement PREMIUM
  * - Vérifie que l'utilisateur est OWNER du profil
  * - Génère un code humain (8 chars), stocke seulement le hash
  * - Retourne le code en clair UNE SEULE FOIS
- * 
+ *
  * Body: { profile_id: string, expires_at?: string (ISO), max_uses?: number (défaut: 1) }
  * Retourne: { ok: true, code: string, expires_at: string, max_uses: number }
  */
 router.post('/invites/create',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
-      const userId = req.user?.id;
-      
+      const userId = (req as any).user?.id;
+
       // 1. Vérifier l'authentification
       if (!userId) {
         return res.status(401).json({
@@ -412,7 +412,7 @@ router.post('/invites/create',
       }
 
       // 5. Calculer la date d'expiration (défaut: 7 jours)
-      let expiresAtDate;
+      let expiresAtDate: Date;
       if (expires_at) {
         expiresAtDate = new Date(expires_at);
         if (isNaN(expiresAtDate.getTime())) {
@@ -431,8 +431,8 @@ router.post('/invites/create',
       const maxUsesValue = typeof max_uses === 'number' && max_uses > 0 ? max_uses : 1;
 
       // 7. Générer un code unique et le hasher
-      let code;
-      let codeHash;
+      let code: string = '';
+      let codeHash: string = '';
       let attempts = 0;
       const maxAttempts = 10;
 
@@ -496,7 +496,7 @@ router.post('/invites/create',
         max_uses: invite.max_uses
       });
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('[INVITES] ❌ Erreur inattendue /invites/create:', error);
       console.error('[INVITES] Stack:', error?.stack);
       return res.status(500).json({
@@ -510,7 +510,7 @@ router.post('/invites/create',
 
 /**
  * POST /invites/redeem
- * 
+ *
  * Utilise un code d'invitation (pour les aidants)
  * - Requiert authentification
  * - Hash le code côté serveur et recherche l'invite valide
@@ -518,16 +518,16 @@ router.post('/invites/create',
  * - Crée profile_access (ou profile_members)
  * - Incrémente uses_count
  * - Retourne les infos du profil ajouté
- * 
+ *
  * Body: { code: string }
  * Retourne: { ok: true, profile_id: string, profile_name?: string }
  */
 router.post('/invites/redeem',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
-      const userId = req.user?.id;
-      
+      const userId = (req as any).user?.id;
+
       // 1. Vérifier l'authentification
       if (!userId) {
         return res.status(401).json({
@@ -596,7 +596,7 @@ router.post('/invites/redeem',
       // 5. Vérifier que l'invitation n'est pas expirée
       const now = new Date();
       const expiresAt = new Date(invite.expires_at);
-      
+
       if (now > expiresAt) {
         console.log(`[INVITES] ❌ Invitation expirée: ${invite.id}`);
         return res.status(400).json({
@@ -674,7 +674,7 @@ router.post('/invites/redeem',
         .eq('id', invite.profile_id)
         .single();
 
-      const profileName = profile?.display_name || 
+      const profileName = profile?.display_name ||
                           [profile?.first_name, profile?.last_name].filter(Boolean).join(' ') ||
                           'Profil';
 
@@ -687,7 +687,7 @@ router.post('/invites/redeem',
         owner_user_id: invite.created_by
       });
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('[INVITES] ❌ Erreur inattendue /invites/redeem:', error);
       console.error('[INVITES] Stack:', error?.stack);
       return res.status(500).json({

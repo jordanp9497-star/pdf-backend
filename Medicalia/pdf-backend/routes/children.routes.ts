@@ -9,6 +9,7 @@
  */
 
 import express from 'express';
+import type { Request, Response } from 'express';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
 
@@ -17,18 +18,18 @@ const supabase = supabaseAdmin;
 
 const SEX_VALUES = ['M', 'F', 'X'];
 
-function getUserId(req) {
-  return req.userId || req.user?.id;
+function getUserId(req: Request): string | undefined {
+  return (req as any).userId || (req as any).user?.id;
 }
 
-function json400(res, message) {
+function json400(res: Response, message: string) {
   return res.status(400).json({ ok: false, error: 'BAD_REQUEST', message });
 }
 
 /**
  * Valide le body create/update: first_name non vide, sex ∈ M/F/X si fourni.
  */
-function validateChildBody(body, isCreate) {
+function validateChildBody(body: Record<string, any>, isCreate: boolean): Record<string, any> {
   if (!body || typeof body !== 'object') return { error: 'Body JSON attendu' };
   const first_name = body.first_name != null ? String(body.first_name).trim() : '';
   if (isCreate && !first_name) return { error: 'first_name est requis et ne doit pas être vide' };
@@ -43,7 +44,7 @@ function validateChildBody(body, isCreate) {
 /**
  * GET /api/children – Liste des enfants (owner_user_id = auth user)
  */
-router.get('/', authenticateSupabase, async (req, res) => {
+router.get('/', authenticateSupabase, async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
     if (!userId) {
@@ -72,7 +73,7 @@ router.get('/', authenticateSupabase, async (req, res) => {
 /**
  * POST /api/children – Créer un enfant
  */
-router.post('/', authenticateSupabase, async (req, res) => {
+router.post('/', authenticateSupabase, async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
     if (!userId) {
@@ -105,7 +106,7 @@ router.post('/', authenticateSupabase, async (req, res) => {
 /**
  * GET /api/children/:id – Détail d'un enfant (vérifier owner)
  */
-router.get('/:id', authenticateSupabase, async (req, res) => {
+router.get('/:id', authenticateSupabase, async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
     if (!userId) {
@@ -138,7 +139,7 @@ router.get('/:id', authenticateSupabase, async (req, res) => {
 /**
  * PATCH /api/children/:id – Mise à jour (first_name, birth_date, sex, notes, health_json)
  */
-router.patch('/:id', authenticateSupabase, async (req, res) => {
+router.patch('/:id', authenticateSupabase, async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
     if (!userId) {
@@ -150,7 +151,7 @@ router.patch('/:id', authenticateSupabase, async (req, res) => {
     const validation = validateChildBody(req.body || {}, false);
     if (validation.error) return json400(res, validation.error);
 
-    const update = {};
+    const update: Record<string, unknown> = {};
     if (validation.first_name !== undefined) update.first_name = validation.first_name;
     if (validation.birth_date !== undefined) update.birth_date = validation.birth_date ?? null;
     if (validation.sex !== undefined) update.sex = validation.sex != null && validation.sex !== '' ? String(validation.sex).toUpperCase() : null;
@@ -188,7 +189,7 @@ router.patch('/:id', authenticateSupabase, async (req, res) => {
 /**
  * DELETE /api/children/:id – Supprimer un enfant (vérifier owner)
  */
-router.delete('/:id', authenticateSupabase, async (req, res) => {
+router.delete('/:id', authenticateSupabase, async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
     if (!userId) {

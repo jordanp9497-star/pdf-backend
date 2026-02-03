@@ -1,12 +1,12 @@
 /**
  * Routes pour la gestion des liens patient <-> aidant
- * 
+ *
  * POST /care/invite - Inviter un aidant (patient)
  * POST /care/accept - Accepter une invitation (aidant)
  * POST /care/revoke - Révoquer un lien (patient)
  */
 
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { requireEntitlement } from '../middlewares/requireEntitlement.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
@@ -18,13 +18,13 @@ const supabase = supabaseAdmin;
 
 /**
  * POST /care/invite
- * 
+ *
  * Invite un aidant par email
  * - Requiert authentification (req.userId = patient)
  * - Recherche l'aidant par email dans auth.users
  * - Crée un lien care_links avec status='pending'
- * 
- * Body: { 
+ *
+ * Body: {
  *   caregiverEmail: string,
  *   role?: string (optionnel, défaut: 'AIDANT')
  * }
@@ -33,10 +33,10 @@ const supabase = supabaseAdmin;
 router.post('/invite',
   authenticateSupabase,
   requireEntitlement('devices'), // Vérifier la limite d'appareils
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const patientUserId = req.userId || req.user?.id;
+      const patientUserId = (req as any).userId || (req as any).user?.id;
       if (!patientUserId) {
         return res.status(401).json({
           ok: false,
@@ -89,11 +89,11 @@ router.post('/invite',
         // Note: listUsers() peut être lourd avec beaucoup d'utilisateurs
         // Alternative: utiliser une table profiles avec index sur email
         const { data: authUsers, error: authError } = await supabase.auth.admin.listUsers();
-        
+
         if (authError) {
           console.error('[CARE] Error listing users:', {
             errorMessage: authError.message,
-            errorDetails: authError.details
+            errorDetails: (authError as any).details
           });
           return res.status(500).json({
             ok: false,
@@ -104,7 +104,7 @@ router.post('/invite',
 
         // Trouver l'utilisateur par email (case-insensitive)
         const caregiverUser = authUsers?.users?.find(
-          user => user.email?.toLowerCase() === normalizedEmail
+          (user: any) => user.email?.toLowerCase() === normalizedEmail
         );
 
         if (!caregiverUser) {
@@ -209,7 +209,7 @@ router.post('/invite',
           linkId: newLink.id
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[CARE] ❌ Erreur inattendue lors de l\'invitation:', {
           patientUserId,
           caregiverEmail: normalizedEmail,
@@ -237,20 +237,20 @@ router.post('/invite',
 
 /**
  * POST /care/accept
- * 
+ *
  * Accepte une invitation d'aidant
  * - Requiert authentification (req.userId = aidant)
  * - Met à jour le lien avec status='active'
- * 
+ *
  * Body: { linkId: string }
  * Retourne: { ok: true }
  */
 router.post('/accept',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const caregiverUserId = req.userId || req.user?.id;
+      const caregiverUserId = (req as any).userId || (req as any).user?.id;
       if (!caregiverUserId) {
         return res.status(401).json({
           ok: false,
@@ -345,7 +345,7 @@ router.post('/accept',
           ok: true
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[CARE] ❌ Erreur inattendue lors de l\'acceptation:', {
           linkId,
           caregiverUserId,
@@ -373,20 +373,20 @@ router.post('/accept',
 
 /**
  * POST /care/revoke
- * 
+ *
  * Révoque un lien patient-aidant
  * - Requiert authentification (req.userId = patient)
  * - Met à jour le lien avec status='revoked'
- * 
+ *
  * Body: { linkId: string }
  * Retourne: { ok: true }
  */
 router.post('/revoke',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const patientUserId = req.userId || req.user?.id;
+      const patientUserId = (req as any).userId || (req as any).user?.id;
       if (!patientUserId) {
         return res.status(401).json({
           ok: false,
@@ -480,7 +480,7 @@ router.post('/revoke',
           ok: true
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[CARE] ❌ Erreur inattendue lors de la révocation:', {
           linkId,
           patientUserId,

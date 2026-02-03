@@ -1,21 +1,22 @@
 /**
  * Routes de debug (DEV uniquement)
- * 
+ *
  * Endpoints pour vérifier la configuration sans exposer de secrets
  */
 
 import express from 'express';
+import type { Request, Response } from 'express';
 import { APP_CONFIG, SUPABASE_CONFIG, STRIPE_CONFIG } from '../src/config/env.js';
 
 const router = express.Router();
 
 /**
  * GET /debug/env
- * 
+ *
  * Retourne le statut des variables d'environnement (sans exposer les secrets)
  * Uniquement disponible en développement
  */
-router.get('/env', (req, res) => {
+router.get('/env', (req: Request, res: Response) => {
   // Vérifier que nous ne sommes pas en production
   if (APP_CONFIG.nodeEnv === 'production') {
     return res.status(403).json({

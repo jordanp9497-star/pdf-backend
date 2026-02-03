@@ -33,6 +33,14 @@ function requireEnv(name: string): string {
 }
 
 /**
+ * Variable d'environnement optionnelle.
+ */
+function optionalEnv(name: string): string | undefined {
+  const value = process.env[name];
+  return value && value.length > 0 ? value : undefined;
+}
+
+/**
  * Configuration Supabase
  */
 export const SUPABASE_CONFIG = {
@@ -58,6 +66,32 @@ export const APP_CONFIG = {
   baseUrl: requireEnv('APP_BASE_URL'),
   nodeEnv: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
+} as const;
+
+/**
+ * Configuration N8N (webhooks OCR)
+ */
+export const N8N_CONFIG = {
+  webhookUrl: requireEnv('N8N_WEBHOOK_URL'),
+  ocrWebhookUrl: requireEnv('N8N_OCR_WEBHOOK_URL'),
+} as const;
+
+/**
+ * Configuration AI (URLs des APIs)
+ */
+export const AI_CONFIG = {
+  mistralApiUrl: process.env.MISTRAL_API_URL || 'https://api.mistral.ai/v1/chat/completions',
+  openaiApiUrl: process.env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions',
+  mistralApiKey: requireEnv('MISTRAL_API_KEY'),
+  // OpenAI désactivé: ne pas exiger la clé
+  openaiApiKey: optionalEnv('OPENAI_API_KEY'),
+} as const;
+
+/**
+ * Configuration URLs publiques
+ */
+export const PUBLIC_WEB_CONFIG = {
+  baseUrl: process.env.PUBLIC_WEB_BASE_URL || 'https://medicalia.app',
 } as const;
 
 /**
@@ -99,6 +133,20 @@ export function logEnvStatus() {
   console.log('[ENV] APP_BASE_URL:', APP_CONFIG.baseUrl);
   console.log('[ENV] NODE_ENV:', APP_CONFIG.nodeEnv);
   console.log('[ENV] PORT:', APP_CONFIG.port);
+
+  // N8N
+  console.log('[ENV] N8N_WEBHOOK_URL present:', !!N8N_CONFIG.webhookUrl);
+  console.log('[ENV] N8N_OCR_WEBHOOK_URL present:', !!N8N_CONFIG.ocrWebhookUrl);
+
+  // AI
+  console.log('[ENV] MISTRAL_API_KEY present:', !!AI_CONFIG.mistralApiKey,
+    `(masked: ${maskKey(AI_CONFIG.mistralApiKey)})`);
+  console.log('[ENV] MISTRAL_API_URL:', AI_CONFIG.mistralApiUrl);
+  // OPENAI_API_URL conservée pour rétrocompatibilité, mais OpenAI n'est pas utilisé
+  console.log('[ENV] OPENAI_API_URL:', AI_CONFIG.openaiApiUrl);
+
+  // Public web
+  console.log('[ENV] PUBLIC_WEB_BASE_URL:', PUBLIC_WEB_CONFIG.baseUrl);
 }
 
 // Valider toutes les variables au chargement du module

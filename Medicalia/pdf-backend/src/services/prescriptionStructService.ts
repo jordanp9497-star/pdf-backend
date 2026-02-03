@@ -1,9 +1,7 @@
 /**
- * Service de structuration d'ordonnance via OpenAI.
- * Produit un JSON strict, validé par Zod ; fallback header null + items [] si invalide.
+ * Service de structuration d'ordonnance.
+ * OpenAI désactivé: retourne un fallback validé (aucune donnée structurée).
  */
-
-import OpenAI from 'openai';
 import { parsePrescriptionStruct, type PrescriptionStruct } from '../schemas/prescriptionStruct.js';
 
 const SYSTEM_PROMPT = `Tu es un assistant médical. À partir du texte d'une ordonnance française, extrais UNIQUEMENT les informations présentes. Ne jamais inventer.
@@ -35,29 +33,6 @@ export type StructOptions = {
 export async function structurizePrescriptionText(
   options: StructOptions
 ): Promise<PrescriptionStruct> {
-  const { openaiApiKey, rawText } = options;
-  const client = new OpenAI({ apiKey: openaiApiKey });
-
-  const completion = await client.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.1,
-    messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: `Texte de l'ordonnance:\n\n${rawText.slice(0, 12000)}` },
-    ],
-    response_format: { type: 'json_object' },
-  });
-
-  const content = completion.choices[0]?.message?.content;
-  if (!content || typeof content !== 'string') {
-    return parsePrescriptionStruct(null);
-  }
-
-  let raw: unknown;
-  try {
-    raw = JSON.parse(content);
-  } catch {
-    return parsePrescriptionStruct(null);
-  }
-  return parsePrescriptionStruct(raw);
+  void options;
+  return parsePrescriptionStruct(null);
 }

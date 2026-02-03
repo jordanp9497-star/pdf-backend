@@ -27,6 +27,7 @@ import {
 } from '../services/storageService.js';
 import { structurizePrescriptionText } from '../services/prescriptionStructService.js';
 import type { PrescriptionStruct } from '../schemas/prescriptionStruct.js';
+import { AI_CONFIG } from '../config/env.js';
 
 const router = express.Router();
 
@@ -771,7 +772,7 @@ async function ocrImageWithMistral(buffer: Buffer, mimeType: string, traceId: st
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), MISTRAL_OCR_TIMEOUT_MS);
   try {
-    const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
+    const res = await fetch(AI_CONFIG.mistralApiUrl, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -804,66 +805,10 @@ async function ocrImageWithMistral(buffer: Buffer, mimeType: string, traceId: st
 }
 
 /**
- * Fallback OCR via OpenAI Vision (image base64 -> texte brut FR). Retourne '' si échec / pas de clé.
- */
-async function ocrImageWithOpenAIVision(buffer: Buffer, mimeType: string, traceId: string): Promise<string> {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) {
-    console.log(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] OPENAI_API_KEY absent (fallback Vision)`);
-    return '';
-  }
-  const base64 = buffer.toString('base64');
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), OPENAI_OCR_TIMEOUT_MS);
-  try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        max_tokens: 4096,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'Extrais le texte de cette ordonnance médicale française. Retourne uniquement le texte brut, sans commentaire.' },
-              {
-                type: 'image_url',
-                image_url: { url: `data:${mimeType};base64,${base64}` },
-              },
-            ],
-          },
-        ],
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    if (!res.ok) {
-      console.error(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] OpenAI Vision status`, res.status);
-      return '';
-    }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    const text = data?.choices?.[0]?.message?.content ?? '';
-    return (text || '').replace(/\s+/g, ' ').trim();
-  } catch (e) {
-    clearTimeout(timeoutId);
-    console.error(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] OpenAI Vision`, e);
-    return '';
-  }
-}
-
-/**
- * OCR image : Mistral d'abord, fallback OpenAI Vision si vide.
+ * OCR image : Mistral uniquement (OpenAI désactivé).
  */
 async function ocrImage(buffer: Buffer, mimeType: string, traceId: string): Promise<string> {
   let rawText = await ocrImageWithMistral(buffer, mimeType, traceId);
-  if (!rawText || rawText.length < 20) {
-    console.log(`${LOG_PREFIX_PHOTO}[${traceId}][ocr] fallback OpenAI Vision`);
-    rawText = await ocrImageWithOpenAIVision(buffer, mimeType, traceId);
-  }
   return (rawText || '').trim();
 }
 
@@ -907,78 +852,21 @@ function processPrescriptionPhoto(params: {
         return;
       }
 
-      // 2) Sauver raw_text dans prescriptions (on le met dans l'update final)
-      // 3) Parser raw_text (médecin/patient/date + items) via GPT JSON
-      console.log(step('parse_ai'));
-      let extracted: PrescriptionStruct = { date_ordonnance: null, medecin: null, patient: null, items: [] };
-      const openaiKey = process.env.OPENAI_API_KEY;
-      if (openaiKey) {
-        try {
-          const timeoutPromise = new Promise<PrescriptionStruct>((_, reject) =>
-            setTimeout(() => reject(new Error('OPENAI_TIMEOUT')), OPENAI_TIMEOUT_MS_PHOTO)
-          );
-          extracted = await Promise.race([
-            structurizePrescriptionText({ openaiApiKey: openaiKey, rawText }),
-            timeoutPromise,
-          ]);
-        } catch (e) {
-          console.error(step('parse_ai'), e);
-          // Parse échoue => manual_required mais on sauve raw_text
-          await supabaseAdmin
-            .from('prescriptions')
-            .update({
-              status: PrescriptionStatus.MANUAL_REQUIRED,
-              raw_text: rawText,
-              data: { source: 'photo', error: 'ai_failed' },
-            })
-            .eq('id', prescriptionId);
-          return;
-        }
-      }
-
-      const prescriptionData = {
-        date_ordonnance: extracted.date_ordonnance ?? null,
-        medecin: extracted.medecin ?? null,
-        patient: extracted.patient ?? null,
-        items: extracted.items ?? [],
-      };
-      const items = Array.isArray(extracted.items) ? extracted.items : [];
-
-      // 4) Insert prescription_items : uniquement colonnes existantes (prescription_id, user_id, profile_id, idx, label, raw_line, data)
-      if (items.length > 0) {
-        console.log(step('prescription_items_insert'));
-        type ItemLike = { nom?: string | null; label?: string | null; raw_line?: string | null; [k: string]: unknown };
-        const rows = items.slice(0, 500).map((item: ItemLike, index: number) => ({
-          prescription_id: prescriptionId,
-          user_id: userId,
-          profile_id: profileId,
-          idx: index,
-          label: item.nom ?? item.label ?? null,
-          raw_line: item.raw_line ?? null,
-          data: item as Record<string, unknown>,
-        }));
-        const { error: itemsErr } = await supabaseAdmin.from('prescription_items').insert(rows);
-        if (itemsErr) {
-          await setError('prescription_items_insert', itemsErr);
-          return;
-        }
-      }
-
-      // 5) Update prescriptions : raw_text toujours sauvegardé ; status = 'ready' si au moins 1 item, sinon 'manual_required'
-      const finalStatus = items.length >= 1 ? PrescriptionStatus.READY : PrescriptionStatus.MANUAL_REQUIRED;
-      console.log(step('prescriptions_update'), finalStatus);
+      // OpenAI désactivé: on ne structure pas automatiquement.
+      // On sauvegarde le raw_text et on met MANUAL_REQUIRED pour forcer la vérification manuelle côté app.
+      console.log(step('prescriptions_update'), PrescriptionStatus.MANUAL_REQUIRED);
       const { error: updateErr } = await supabaseAdmin
         .from('prescriptions')
         .update({
-          status: finalStatus,
+          status: PrescriptionStatus.MANUAL_REQUIRED,
           raw_text: rawText,
-          data: prescriptionData,
+          data: { source: 'photo', extraction: 'ocr_only' },
         })
         .eq('id', prescriptionId);
       if (updateErr) {
         await setError('prescriptions_update', updateErr);
-        return;
       }
+      return;
       console.log(step('done'), finalStatus);
     } catch (err) {
       console.error(step('exception'), err);

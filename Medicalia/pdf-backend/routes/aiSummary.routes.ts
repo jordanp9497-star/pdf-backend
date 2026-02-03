@@ -1,11 +1,11 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 
 const router = express.Router();
 
 /**
  * Handler pour GET /ai/medical-summary/health (dash)
  */
-router.get('/medical-summary/health', (req, res) => {
+router.get('/medical-summary/health', (req: Request, res: Response) => {
   console.log(`[AI_SUMMARY] GET /medical-summary/health - ${req.originalUrl}`);
   return res.status(200).json({
     ok: true,
@@ -17,7 +17,7 @@ router.get('/medical-summary/health', (req, res) => {
 /**
  * Handler pour GET /ai/medical_summary/health (underscore)
  */
-router.get('/medical_summary/health', (req, res) => {
+router.get('/medical_summary/health', (req: Request, res: Response) => {
   console.log(`[AI_SUMMARY] GET /medical_summary/health - ${req.originalUrl}`);
   return res.status(200).json({
     ok: true,
@@ -29,9 +29,9 @@ router.get('/medical_summary/health', (req, res) => {
 /**
  * Handler unique pour POST /ai/medical-summary et /ai/medical_summary
  */
-function handlePost(req, res) {
+function handlePost(req: Request, res: Response) {
   console.log(`[AI_SUMMARY] POST ${req.path} - ${req.originalUrl}`);
-  
+
   // Vérification du body
   if (!req.body || typeof req.body !== 'object') {
     return res.status(400).json({

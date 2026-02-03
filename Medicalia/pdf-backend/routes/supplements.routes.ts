@@ -1,13 +1,13 @@
 /**
  * Routes pour la gestion des compléments alimentaires
- * 
+ *
  * GET /supplements?profile_id=... - Liste des compléments (tri: actifs d'abord, puis created_at desc)
  * POST /supplements - Crée un complément (owner_user_id = user courant)
  * PATCH /supplements/:id - Modifie un complément (title/notes/status/start_date/end_date/schedule)
  * DELETE /supplements/:id - Supprime un complément
  */
 
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
 
@@ -16,13 +16,18 @@ const router = express.Router();
 // Utiliser le client Supabase admin centralisé
 const supabase = supabaseAdmin;
 
+interface ScheduleValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
 /**
  * Valide le format du schedule
- * 
- * @param {Object} schedule - Objet schedule à valider
- * @returns {{ valid: boolean, error?: string }}
+ *
+ * @param schedule - Objet schedule à valider
+ * @returns { valid: boolean, error?: string }
  */
-function validateSchedule(schedule) {
+function validateSchedule(schedule: any): ScheduleValidationResult {
   if (!schedule || typeof schedule !== 'object') {
     return { valid: false, error: 'Le schedule doit être un objet' };
   }
@@ -73,24 +78,24 @@ function validateSchedule(schedule) {
 
 /**
  * GET /supplements?profile_id=...
- * 
+ *
  * Liste les compléments de l'utilisateur
  * - Requiert authentification (Bearer token Supabase)
  * - Filtre par owner_user_id = user.id (sécurité)
  * - Optionnel: filtre par profile_id si fourni
  * - Tri: actifs d'abord (status='active'), puis created_at desc
- * 
+ *
  * Query params:
  *   - profile_id (optionnel): UUID du profil
- * 
+ *
  * Retourne: { ok: true, supplements: [...] }
  */
 router.get('/',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const userId = req.userId || req.user?.id;
+      const userId = (req as any).userId || (req as any).user?.id;
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -99,7 +104,7 @@ router.get('/',
         });
       }
 
-      const profileId = req.query.profile_id;
+      const profileId = req.query.profile_id as string | undefined;
 
       console.log('[SUPPLEMENTS] GET /supplements', {
         userId,
@@ -147,7 +152,7 @@ router.get('/',
           });
 
           // Vérifier si c'est une erreur de table manquante
-          if (error.code === '42P01' || 
+          if (error.code === '42P01' ||
               error.message?.toLowerCase().includes('relation') ||
               error.message?.toLowerCase().includes('does not exist')) {
             return res.status(500).json({
@@ -165,14 +170,14 @@ router.get('/',
         }
 
         // Trier: actifs d'abord, puis created_at desc
-        const sorted = (supplements || []).sort((a, b) => {
+        const sorted = (supplements || []).sort((a: any, b: any) => {
           // Actifs en premier
           if (a.status === 'active' && b.status !== 'active') return -1;
           if (a.status !== 'active' && b.status === 'active') return 1;
-          
+
           // Puis tri par created_at desc
-          const dateA = new Date(a.created_at || 0);
-          const dateB = new Date(b.created_at || 0);
+          const dateA = new Date(a.created_at || 0).getTime();
+          const dateB = new Date(b.created_at || 0).getTime();
           return dateB - dateA;
         });
 
@@ -183,7 +188,7 @@ router.get('/',
           supplements: sorted
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[SUPPLEMENTS] Error fetching supplements:', {
           userId,
           profileId,
@@ -210,12 +215,12 @@ router.get('/',
 
 /**
  * POST /supplements
- * 
+ *
  * Crée un nouveau complément
  * - Requiert authentification (Bearer token Supabase)
  * - Définit automatiquement owner_user_id = user.id (sécurité)
  * - Valide le schedule si fourni
- * 
+ *
  * Body: {
  *   title: string (requis),
  *   notes?: string,
@@ -225,15 +230,15 @@ router.get('/',
  *   schedule?: { mode, times, daysOfWeek?, dayOfMonth? },
  *   profile_id?: UUID
  * }
- * 
+ *
  * Retourne: { ok: true, supplement: {...} }
  */
 router.post('/',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const userId = req.userId || req.user?.id;
+      const userId = (req as any).userId || (req as any).user?.id;
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -326,7 +331,7 @@ router.post('/',
         const now = new Date().toISOString();
 
         // Construire l'objet à insérer
-        const insertData = {
+        const insertData: Record<string, any> = {
           owner_user_id: userId, // Toujours défini par le serveur (sécurité)
           title: title.trim(),
           notes: notes || null,
@@ -353,7 +358,7 @@ router.post('/',
           });
 
           // Vérifier si c'est une erreur de table manquante
-          if (error.code === '42P01' || 
+          if (error.code === '42P01' ||
               error.message?.toLowerCase().includes('relation') ||
               error.message?.toLowerCase().includes('does not exist')) {
             return res.status(500).json({
@@ -377,7 +382,7 @@ router.post('/',
           supplement
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[SUPPLEMENTS] Error creating supplement:', {
           userId,
           errorMessage: dbError?.message
@@ -403,12 +408,12 @@ router.post('/',
 
 /**
  * PATCH /supplements/:id
- * 
+ *
  * Modifie un complément existant
  * - Requiert authentification (Bearer token Supabase)
  * - Vérifie que owner_user_id = user.id (sécurité)
  * - Valide le schedule si fourni
- * 
+ *
  * Body (tous optionnels): {
  *   title?: string,
  *   notes?: string,
@@ -417,15 +422,15 @@ router.post('/',
  *   end_date?: string (ISO date),
  *   schedule?: { mode, times, daysOfWeek?, dayOfMonth? }
  * }
- * 
+ *
  * Retourne: { ok: true, supplement: {...} }
  */
 router.patch('/:id',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const userId = req.userId || req.user?.id;
+      const userId = (req as any).userId || (req as any).user?.id;
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -458,7 +463,7 @@ router.patch('/:id',
       // Vérifier qu'au moins un champ est fourni
       const hasUpdates = title !== undefined || notes !== undefined || status !== undefined ||
                          start_date !== undefined || end_date !== undefined || schedule !== undefined;
-      
+
       if (!hasUpdates) {
         return res.status(400).json({
           ok: false,
@@ -583,7 +588,7 @@ router.patch('/:id',
         }
 
         // 2. Construire l'objet de mise à jour
-        const updateData = {
+        const updateData: Record<string, any> = {
           updated_at: new Date().toISOString()
         };
 
@@ -625,7 +630,7 @@ router.patch('/:id',
           supplement
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[SUPPLEMENTS] Error updating supplement:', {
           supplementId,
           userId,
@@ -652,19 +657,19 @@ router.patch('/:id',
 
 /**
  * DELETE /supplements/:id
- * 
+ *
  * Supprime un complément
  * - Requiert authentification (Bearer token Supabase)
  * - Vérifie que owner_user_id = user.id (sécurité)
- * 
+ *
  * Retourne: { ok: true }
  */
 router.delete('/:id',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const userId = req.userId || req.user?.id;
+      const userId = (req as any).userId || (req as any).user?.id;
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -758,7 +763,7 @@ router.delete('/:id',
           ok: true
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[SUPPLEMENTS] Error deleting supplement:', {
           supplementId,
           userId,

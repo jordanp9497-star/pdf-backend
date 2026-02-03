@@ -1,10 +1,11 @@
 /**
  * Routes pour la gestion des appareils
- * 
+ *
  * POST /devices/heartbeat - Enregistrer/mettre à jour un appareil
  */
 
 import express from 'express';
+import type { Request, Response } from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { authenticateSupabase } from '../middlewares/auth.js';
 import { supabaseAdmin } from '../src/lib/supabaseAdmin.js';
@@ -16,9 +17,9 @@ const router = express.Router();
  * Crée un client Supabase avec le token utilisateur (pour RLS)
  * Fallback vers service_role si le token n'est pas disponible
  */
-function getSupabaseClient(req) {
+function getSupabaseClient(req: Request) {
   const authHeader = req.headers.authorization;
-  
+
   // Essayer d'utiliser le client user (RLS) si un token est présent
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.substring(7);
@@ -37,27 +38,27 @@ function getSupabaseClient(req) {
             }
           }
         });
-        
+
         return userClient;
-      } catch (error) {
+      } catch (error: any) {
         console.warn('[DEVICES] Erreur création client user, fallback service_role:', error.message);
       }
     }
   }
-  
+
   // Fallback: utiliser service_role
   return supabaseAdmin;
 }
 
 /**
  * POST /devices/heartbeat
- * 
+ *
  * Enregistre ou met à jour un appareil
  * - Requiert authentification (Bearer token Supabase)
  * - Upsert dans public.devices avec last_seen_at
  * - Retourne le nombre d'appareils actifs de l'utilisateur
- * 
- * Body: { 
+ *
+ * Body: {
  *   deviceId: string,
  *   platform: string (ex: "ios", "android"),
  *   model: string (ex: "iPhone 14 Pro"),
@@ -67,10 +68,10 @@ function getSupabaseClient(req) {
  */
 router.post('/heartbeat',
   authenticateSupabase,
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       // Vérifier que l'utilisateur est authentifié
-      const userId = req.userId || req.user?.id;
+      const userId = (req as any).userId || (req as any).user?.id;
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -201,7 +202,7 @@ router.post('/heartbeat',
           });
 
           // Vérifier si c'est une erreur de table manquante
-          if (countError.code === '42P01' || 
+          if (countError.code === '42P01' ||
               countError.message?.toLowerCase().includes('relation') ||
               countError.message?.toLowerCase().includes('does not exist')) {
             console.error('[DEVICES] ❌ Table devices n\'existe pas');
@@ -232,7 +233,7 @@ router.post('/heartbeat',
           deviceCount: deviceCount
         });
 
-      } catch (dbError) {
+      } catch (dbError: any) {
         console.error('[DEVICES] ❌ Erreur inattendue:', {
           userId,
           deviceId,
